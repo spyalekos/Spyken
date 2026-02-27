@@ -79,14 +79,14 @@ def main(page: ft.Page):
     
     # UI Elements
     selected_files_list = ft.ListView(expand=1, spacing=10, padding=20, auto_scroll=True)
-    status_text = ft.Text("Κατάσταση: Σε αναμονή", size=16, color=ft.colors.GREY_400)
+    status_text = ft.Text("Κατάσταση: Σε αναμονή", size=16, color=ft.Colors.GREY_400)
     progress_bar = ft.ProgressBar(width=400, color="amber", bgcolor="#263238", value=0)
     progress_bar.visible = False
     
     file_queue = []
 
     def log(msg, error=False):
-        color = ft.colors.RED_400 if error else ft.colors.GREEN_400
+        color = ft.Colors.RED_400 if error else ft.Colors.GREEN_400
         selected_files_list.controls.append(ft.Text(msg, color=color))
         page.update()
 
@@ -95,7 +95,7 @@ def main(page: ft.Page):
             for f in e.files:
                 if f.path not in file_queue:
                     file_queue.append(f.path)
-                    selected_files_list.controls.append(ft.Text(f"Επιλέχθηκε: {f.name}", color=ft.colors.WHITE70))
+                    selected_files_list.controls.append(ft.Text(f"Επιλέχθηκε: {f.name}", color=ft.Colors.WHITE70))
             page.update()
 
     file_picker = ft.FilePicker(on_result=on_file_picked)
@@ -107,13 +107,13 @@ def main(page: ft.Page):
     def clear_files(e):
         file_queue.clear()
         selected_files_list.controls.clear()
-        selected_files_list.controls.append(ft.Text("Η λίστα καθαρίστηκε", color=ft.colors.GREY_400))
+        selected_files_list.controls.append(ft.Text("Η λίστα καθαρίστηκε", color=ft.Colors.GREY_400))
         page.update()
 
     async def start_conversion(e):
         if not file_queue:
             status_text.value = "Παρακαλώ επιλέξτε αρχεία πρώτα!"
-            status_text.color = ft.colors.RED_400
+            status_text.color = ft.Colors.RED_400
             page.update()
             return
 
@@ -126,7 +126,7 @@ def main(page: ft.Page):
 
         for filepath in file_queue:
             status_text.value = f"Εξαγωγή κειμένου: {os.path.basename(filepath)}"
-            status_text.color = ft.colors.BLUE_400
+            status_text.color = ft.Colors.BLUE_400
             page.update()
             
             try:
@@ -155,7 +155,7 @@ def main(page: ft.Page):
                 log(f"Σφάλμα στο {os.path.basename(filepath)}: {str(ex)}", error=True)
 
         status_text.value = "Κατάσταση: Όλες οι μετατροπές ολοκληρώθηκαν!"
-        status_text.color = ft.colors.GREEN_400
+        status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         convert_btn.disabled = False
         pick_btn.disabled = False
@@ -167,29 +167,29 @@ def main(page: ft.Page):
         "Επιλογή Αρχείων (.docx, .pdf)", 
         icon=ft.icons.FOLDER_OPEN,
         on_click=pick_files_clicked,
-        style=ft.ButtonStyle(bgcolor=ft.colors.INDIGO_700, color=ft.colors.WHITE)
+        style=ft.ButtonStyle(bgcolor=ft.Colors.INDIGO_700, color=ft.Colors.WHITE)
     )
     
     clear_btn = ft.ElevatedButton(
         "Καθαρισμός Λίστας", 
         icon=ft.icons.CLEAR,
         on_click=clear_files,
-        style=ft.ButtonStyle(bgcolor=ft.colors.RED_900, color=ft.colors.WHITE)
+        style=ft.ButtonStyle(bgcolor=ft.Colors.RED_900, color=ft.Colors.WHITE)
     )
 
     convert_btn = ft.ElevatedButton(
         "Έναρξη Μετατροπής", 
         icon=ft.icons.PLAY_ARROW,
         on_click=start_conversion,
-        style=ft.ButtonStyle(bgcolor=ft.colors.GREEN_700, color=ft.colors.WHITE)
+        style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE)
     )
 
     # Layout assembling
     header = ft.Row(
         [
-            ft.Icon(ft.icons.AUDIOTRACK, size=40, color=ft.colors.AMBER_400),
-            ft.Text("Spyken", size=32, weight=ft.FontWeight.BOLD, color=ft.colors.AMBER_400),
-            ft.Text("Έγγραφο σε MP3", size=20, color=ft.colors.GREY_300)
+            ft.Icon(ft.icons.AUDIOTRACK, size=40, color=ft.Colors.AMBER_400),
+            ft.Text("Spyken", size=32, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_400),
+            ft.Text("Έγγραφο σε MP3", size=20, color=ft.Colors.GREY_300)
         ],
         alignment=ft.MainAxisAlignment.CENTER,
     )
@@ -204,7 +204,7 @@ def main(page: ft.Page):
                 button_row,
                 ft.Container(
                     content=selected_files_list,
-                    border=ft.border.all(1, ft.colors.WHITE24),
+                    border=ft.border.all(1, ft.Colors.WHITE24),
                     border_radius=10,
                     padding=10,
                     expand=True
