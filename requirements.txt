@@ -1,0 +1,5 @@
+flet
+edge-tts
+python-docx
+PyMuPDF
+pyinstaller
