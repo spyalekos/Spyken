@@ -246,9 +246,9 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
     from proglog import ProgressBarLogger
 
     class FletMoviepyLogger(ProgressBarLogger):
-        def __init__(self, callback):
+        def __init__(self, cb):
             super().__init__()
-            self.callback = callback
+            self.ui_callback = cb
 
         def bars_callback(self, bar, attr, value, old_value=None):
             # 't' is the main progress bar for write_videofile
@@ -256,7 +256,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 total = self.bars[bar].get('total', 1)
                 if total > 0:
                     pct = int((value / total) * 100)
-                    self.callback(value, total, f"Συναρμολόγηση βίντεο... {pct}%")
+                    self.ui_callback(value, total, f"Συναρμολόγηση βίντεο... {pct}%")
 
     ext = filepath.lower().split('.')[-1]
     temp_dir = tempfile.mkdtemp()
