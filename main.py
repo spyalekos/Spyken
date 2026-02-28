@@ -553,12 +553,15 @@ def main(page: ft.Page):
 
             try:
                 output_path = os.path.splitext(filepath)[0] + ".mp4"
+                loop = asyncio.get_running_loop()
 
                 def update_video_progress(current, total, msg=""):
-                    progress_bar.value = current / max(total, 1)
-                    status_text.value = f"🎬 {msg}" if msg else f"🎬 Παράγραφος {current}/{total}"
-                    status_text.color = ft.Colors.PURPLE_300
-                    page.update()
+                    def _update_ui():
+                        progress_bar.value = current / max(total, 1)
+                        status_text.value = f"🎬 {msg}" if msg else f"🎬 Παράγραφος {current}/{total}"
+                        status_text.color = ft.Colors.PURPLE_300
+                        page.update()
+                    loop.call_soon_threadsafe(_update_ui)
 
                 await convert_to_video(filepath, output_path, update_video_progress)
                 log(f"🎬 Βίντεο: {os.path.basename(output_path)}")
