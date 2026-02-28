@@ -3,3 +3,7 @@ edge-tts
 python-docx
 PyMuPDF
 pyinstaller
+moviepy
+mutagen
+Pillow
+imageio-ffmpeg
