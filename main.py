@@ -156,7 +156,11 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
     # Header bar
     draw.rectangle([0, 0, target_w, 60], fill=HEADER_BG)
     header_txt = f"Παράγραφος {para_idx + 1} / {total}"
-    draw.text((target_w // 2, 30), header_txt, fill=HEADER_COLOR, anchor="mm")
+    try:
+        header_font = ImageFont.truetype("arial.ttf", size=24)
+        draw.text((target_w // 2, 30), header_txt, font=header_font, fill=HEADER_COLOR, anchor="mm")
+    except Exception:
+        draw.text((target_w // 2, 30), header_txt, fill=HEADER_COLOR, anchor="mm")
 
     # Figure out a reasonable font size that fits the text box
     box_w = target_w - 120
@@ -185,15 +189,26 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
 
     # Draw text lines
     y_cursor = box_y + 10
+    try:
+        font_size = max(12, int(line_h * 0.7))
+        main_font = ImageFont.truetype("arial.ttf", size=font_size)
+    except Exception:
+        main_font = ImageFont.load_default()
+
     for line in lines:
-        draw.text((box_x + 10, y_cursor), line, fill=TEXT_COLOR)
+        draw.text((box_x + 10, y_cursor), line, font=main_font, fill=TEXT_COLOR)
         y_cursor += line_h
         if y_cursor > box_y + box_h:
             break
 
     # Footer
     draw.rectangle([0, target_h - 40, target_w, target_h], fill=HEADER_BG)
-    draw.text((target_w // 2, target_h - 20), "Spyken · MP4 by spyalekos", fill=(100, 100, 130), anchor="mm")
+    footer_txt = "Spyken · MP4 by spyalekos"
+    try:
+        footer_font = ImageFont.truetype("arial.ttf", size=18)
+        draw.text((target_w // 2, target_h - 20), footer_txt, font=footer_font, fill=(100, 100, 130), anchor="mm")
+    except Exception:
+        draw.text((target_w // 2, target_h - 20), footer_txt, fill=(100, 100, 130), anchor="mm")
 
     return canvas
 
@@ -227,7 +242,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
     generate TTS per paragraph, build video frames, assemble mp4.
     """
     import numpy as np
-    from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
+    from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, concatenate_audioclips
 
     ext = filepath.lower().split('.')[-1]
     temp_dir = tempfile.mkdtemp()
@@ -272,17 +287,25 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
             )
 
-            # For very long paragraphs, use only first chunk for TTS (visual stays same)
-            tts_text = chunk_text(text, 800)[0]
+            # For long paragraphs, generate TTS for all chunks and concatenate their audio
+            chunks = chunk_text(text, 800)
+            chunk_audio_clips = []
+            
+            for c_idx, chunk in enumerate(chunks):
+                chunk_audio_path = os.path.join(temp_dir, f"audio_{i}_{c_idx}.mp3")
+                ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
+                if ok:
+                    chunk_audio_clips.append(AudioFileClip(chunk_audio_path))
 
-            audio_path = os.path.join(temp_dir, f"audio_{i}.mp3")
-            ok = await generate_tts_chunk(tts_text, voice, audio_path)
-
-            if ok:
-                duration = get_mp3_duration(audio_path)
+            if chunk_audio_clips:
+                if len(chunk_audio_clips) == 1:
+                    combined_audio = chunk_audio_clips[0]
+                else:
+                    combined_audio = concatenate_audioclips(chunk_audio_clips)
+                duration = combined_audio.duration
                 voice_index += 1
             else:
-                audio_path = None
+                combined_audio = None
                 duration = 3.0
 
             # ── 3. Render frame ───────────────────────────────────────────────
@@ -301,12 +324,12 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             # ── 4. Build clip ─────────────────────────────────────────────────
             img_clip = ImageClip(frame_np, duration=duration)
 
-            if audio_path:
-                audio_clip = AudioFileClip(audio_path)
-                # Trim audio to frame duration if needed
-                if audio_clip.duration > duration:
-                    audio_clip = audio_clip.subclipped(0, duration)
-                img_clip = img_clip.with_audio(audio_clip)
+            if combined_audio:
+                # Need to explicitly set duration on the audio clip, 
+                # though concatenate_audioclips does this usually.
+                if combined_audio.duration > duration:
+                    combined_audio = combined_audio.subclipped(0, duration)
+                img_clip = img_clip.with_audio(combined_audio)
 
             clips.append(img_clip)
 
@@ -396,7 +419,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "0.91"
+    APP_VERSION = "0.92"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
