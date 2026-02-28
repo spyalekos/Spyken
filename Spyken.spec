@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+from PyInstaller.utils.hooks import copy_metadata
+
+datas  = copy_metadata('imageio')
+datas += copy_metadata('imageio-ffmpeg')
+datas += copy_metadata('moviepy')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=['imageio', 'imageio.plugins', 'imageio.plugins.ffmpeg',
+                   'imageio.v3', 'imageio_ffmpeg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
