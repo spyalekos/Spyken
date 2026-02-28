@@ -15,7 +15,7 @@ VOICE_EN_FEMALE = "en-GB-SoniaNeural"
 # Video frame resolution
 VIDEO_W = 1280
 VIDEO_H = 720
-VIDEO_FPS = 24
+VIDEO_FPS = 10  # Reduced from 24 to speed up rendering significantly
 
 
 def is_english(text: str) -> bool:
@@ -243,6 +243,20 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
     """
     import numpy as np
     from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, concatenate_audioclips
+    from proglog import ProgressBarLogger
+
+    class FletMoviepyLogger(ProgressBarLogger):
+        def __init__(self, callback):
+            super().__init__()
+            self.callback = callback
+
+        def bars_callback(self, bar, attr, value, old_value=None):
+            # 't' is the main progress bar for write_videofile
+            if bar == 't':
+                total = self.bars[bar].get('total', 1)
+                if total > 0:
+                    pct = int((value / total) * 100)
+                    self.callback(value, total, f"Συναρμολόγηση βίντεο... {pct}%")
 
     ext = filepath.lower().split('.')[-1]
     temp_dir = tempfile.mkdtemp()
@@ -334,8 +348,10 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             clips.append(img_clip)
 
         # ── 5. Assemble final video ────────────────────────────────────────────
-        progress_callback(total, total, "Συναρμολόγηση βίντεο…")
+        progress_callback(total, total, "Συναρμολόγηση βίντεο...")
         await asyncio.sleep(0)
+
+        ui_logger = FletMoviepyLogger(progress_callback)
 
         final = concatenate_videoclips(clips, method="compose")
         final.write_videofile(
@@ -345,7 +361,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             audio_codec="aac",
             temp_audiofile=os.path.join(temp_dir, "tmp_audio.m4a"),
             remove_temp=True,
-            logger=None,
+            logger=ui_logger,
         )
         final.close()
 
@@ -419,7 +435,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "0.92"
+    APP_VERSION = "0.93"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
