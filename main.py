@@ -162,26 +162,80 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
     except Exception:
         draw.text((target_w // 2, 30), header_txt, fill=HEADER_COLOR, anchor="mm")
 
-    # Figure out a reasonable font size that fits the text box
+    # Layout dimensions
     box_w = target_w - 120
     box_h = target_h - 160
     box_x = 60
     box_y = 90
 
-    # Word-wrap
-    max_chars_per_line = max(30, box_w // 14)
-    lines = textwrap.wrap(text, width=max_chars_per_line)
-    if not lines:
-        lines = ["(κενή παράγραφος)"]
+    # Auto-fit font size and wrapping
+    def try_wrap(font_sz):
+        try:
+            font = ImageFont.truetype("arial.ttf", size=font_sz)
+        except Exception:
+            font = ImageFont.load_default()
+            font_sz = 14  # Default fallback
 
-    # Estimate line height and adjust font size to fit
-    line_h = box_h // max(len(lines), 1)
-    line_h = min(line_h, 50)
-    line_h = max(line_h, 22)
+        words = text.split()
+        if not words:
+            return ["(κενή παράγραφος)"], font, font_sz
+
+        lines = []
+        current_line = []
+        for word in words:
+            test_line = " ".join(current_line + [word])
+            # getbbox returns (left, top, right, bottom)
+            w = font.getbbox(test_line)[2] if hasattr(font, 'getbbox') else font.getsize(test_line)[0]
+            if w <= box_w:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                    current_line = [word]
+                else:
+                    # Word itself is wider than the box
+                    lines.append(word)
+                    current_line = []
+        if current_line:
+            lines.append(" ".join(current_line))
+            
+        return lines, font, font_sz
+
+    # Binary search or simple step-down for best font size
+    best_lines = []
+    best_font = None
+    best_font_size = 50
+    line_h = 50
+
+    for f_size in range(50, 15, -2):
+        lines, font, actual_f_size = try_wrap(f_size)
+        
+        # Estimate height block
+        test_line_h = max(22, int(actual_f_size * 1.5))
+        total_h = len(lines) * test_line_h
+        
+        if total_h <= box_h or f_size == 16:
+            best_lines = lines
+            best_font = font
+            best_font_size = actual_f_size
+            line_h = test_line_h
+            break
+
+    if not best_lines: # fallback
+        best_lines, best_font, best_font_size = try_wrap(24)
+        line_h = 36
 
     # Draw highlight box
-    text_block_h = len(lines) * line_h + 40
-    text_block_w = box_w + 40
+    text_block_h = len(best_lines) * line_h + 40
+    # Calculate real max width of wrapped lines
+    max_line_w = 0
+    for line in best_lines:
+        w = best_font.getbbox(line)[2] if hasattr(best_font, 'getbbox') else best_font.getsize(line)[0]
+        max_line_w = max(max_line_w, w)
+    
+    # Cap block width at box_w
+    text_block_w = min(max_line_w + 40, box_w + 40)
+    
     tx = box_x - 20
     ty = box_y - 10
     draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], fill=HIGHLIGHT)
@@ -189,14 +243,8 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
 
     # Draw text lines
     y_cursor = box_y + 10
-    try:
-        font_size = max(12, int(line_h * 0.7))
-        main_font = ImageFont.truetype("arial.ttf", size=font_size)
-    except Exception:
-        main_font = ImageFont.load_default()
-
-    for line in lines:
-        draw.text((box_x + 10, y_cursor), line, font=main_font, fill=TEXT_COLOR)
+    for line in best_lines:
+        draw.text((box_x + 10, y_cursor), line, font=best_font, fill=TEXT_COLOR)
         y_cursor += line_h
         if y_cursor > box_y + box_h:
             break
