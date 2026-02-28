@@ -1,20 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import copy_metadata
-
-# moviepy uses importlib.metadata.version("imageio") at runtime —
-# PyInstaller must bundle the dist-info directories so it doesn't crash.
-datas  = copy_metadata('imageio')
-datas += copy_metadata('imageio-ffmpeg')
-datas += copy_metadata('moviepy')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=datas,
-    hiddenimports=['imageio', 'imageio.plugins', 'imageio.plugins.ffmpeg',
-                   'imageio.v3', 'imageio_ffmpeg'],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
