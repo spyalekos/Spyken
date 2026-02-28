@@ -354,16 +354,20 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
         ui_logger = FletMoviepyLogger(progress_callback)
 
         final = concatenate_videoclips(clips, method="compose")
-        final.write_videofile(
-            output_path,
-            fps=VIDEO_FPS,
-            codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=os.path.join(temp_dir, "tmp_audio.m4a"),
-            remove_temp=True,
-            logger=ui_logger,
-        )
-        final.close()
+        
+        def _write_video():
+            final.write_videofile(
+                output_path,
+                fps=VIDEO_FPS,
+                codec="libx264",
+                audio_codec="aac",
+                temp_audiofile=os.path.join(temp_dir, "tmp_audio.m4a"),
+                remove_temp=True,
+                logger=ui_logger,
+            )
+            final.close()
+            
+        await asyncio.to_thread(_write_video)
 
     finally:
         # Cleanup temp files
