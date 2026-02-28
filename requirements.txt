@@ -6,4 +6,5 @@ pyinstaller
 moviepy
 mutagen
 Pillow
+imageio
 imageio-ffmpeg
