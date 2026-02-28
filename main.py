@@ -251,12 +251,12 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             self.ui_callback = cb
 
         def bars_callback(self, bar, attr, value, old_value=None):
-            # 't' is the main progress bar for write_videofile
-            if bar == 't':
+            if attr == 'index' and bar in ('chunk', 't', 'frame_index'):
                 total = self.bars[bar].get('total', 1)
                 if total > 0:
                     pct = int((value / total) * 100)
-                    self.ui_callback(value, total, f"Συναρμολόγηση βίντεο... {pct}%")
+                    msg = "Μίξη ήχου..." if bar == 'chunk' else "Συναρμολόγηση βίντεο..."
+                    self.ui_callback(value, total, f"{msg} {pct}%")
 
     ext = filepath.lower().split('.')[-1]
     temp_dir = tempfile.mkdtemp()
