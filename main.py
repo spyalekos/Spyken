@@ -17,6 +17,9 @@ VIDEO_W = 1280
 VIDEO_H = 720
 VIDEO_FPS = 10  # Reduced from 24 to speed up rendering significantly
 
+# Fluorescent green highlight color
+HIGHLIGHT_COLOR = (57, 255, 20)
+
 
 def is_english(text: str) -> bool:
     """Returns True if the majority of letters in text are Latin (English)."""
@@ -32,6 +35,28 @@ def is_valid_text(text: str) -> bool:
     if not any(c.isalpha() for c in text):
         return False
     return True
+
+
+import re as _re
+_EMOJI_RE = _re.compile(
+    "["
+    "\U0001F000-\U0001FFFF"  # emoji, symbols, flags
+    "\U00002300-\U000027BF"  # misc technical/dingbats
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0001FA00-\U0001FAFF"  # extended symbols
+    "]+", flags=_re.UNICODE
+)
+
+def clean_for_tts(text: str) -> str:
+    """
+    Remove emoji and symbol characters that cause edge_tts to produce
+    garbled word-boundary events (character spans instead of words).
+    The cleaned text is used ONLY for TTS; original text is kept for
+    PDF word-rect matching.
+    """
+    cleaned = _EMOJI_RE.sub(' ', text)
+    cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
 
 
 def chunk_text(text: str, max_chars: int = 800) -> list[str]:
@@ -67,14 +92,132 @@ def extract_paragraphs(filepath: str) -> list[str]:
         doc = fitz.open(filepath)
         for page in doc:
             blocks = page.get_text("blocks")
-            for block in blocks:
-                text = " ".join(block[4].strip().splitlines()).strip()
+            merged = merge_pdf_blocks(blocks)
+            for (x0, y0, x1, y1, text) in merged:
                 if is_valid_text(text):
                     paragraphs.append(text)
     else:
         raise ValueError("Μη υποστηριζόμενη μορφή αρχείου")
 
     return paragraphs
+
+
+def merge_pdf_blocks(blocks: list) -> list:
+    """
+    Merge adjacent PDF text blocks that belong to the same paragraph.
+    Two consecutive blocks are merged when they are vertically close
+    (gap ≤ 1.8 × estimated line height) and horizontally overlapping.
+
+    Input : list of fitz block tuples (x0, y0, x1, y1, text, block_no, block_type)
+    Returns: list of (x0, y0, x1, y1, text) tuples.
+    """
+    # Keep only text blocks (block_type == 0)
+    text_blocks = [b for b in blocks if b[6] == 0]
+
+    if not text_blocks:
+        return []
+
+    merged = []
+    cur_x0, cur_y0, cur_x1, cur_y1, cur_text = (
+        text_blocks[0][0], text_blocks[0][1],
+        text_blocks[0][2], text_blocks[0][3],
+        text_blocks[0][4].strip(),
+    )
+
+    for b in text_blocks[1:]:
+        bx0, by0, bx1, by1, btxt = b[0], b[1], b[2], b[3], b[4].strip()
+
+        # Estimate line height of current block
+        cur_height = cur_y1 - cur_y0
+        lines_estimate = max(1, cur_text.count('\n') + 1)
+        line_h = cur_height / lines_estimate
+
+        # Vertical gap between end of current block and start of next
+        v_gap = by0 - cur_y1
+
+        # Horizontal overlap check: blocks share at least some horizontal range
+        h_overlap = min(cur_x1, bx1) - max(cur_x0, bx0)
+
+        if v_gap >= 0 and v_gap <= line_h * 1.8 and h_overlap > -20:
+            # Merge: join with a space (replace internal newlines too)
+            cur_text = cur_text + " " + btxt
+            cur_x0 = min(cur_x0, bx0)
+            cur_y1 = by1
+            cur_x1 = max(cur_x1, bx1)
+        else:
+            merged.append((cur_x0, cur_y0, cur_x1, cur_y1, cur_text))
+            cur_x0, cur_y0, cur_x1, cur_y1, cur_text = bx0, by0, bx1, by1, btxt
+
+    merged.append((cur_x0, cur_y0, cur_x1, cur_y1, cur_text))
+
+    # Clean up internal newlines in each merged block
+    result = []
+    for (x0, y0, x1, y1, t) in merged:
+        clean = " ".join(t.splitlines()).strip()
+        result.append((x0, y0, x1, y1, clean))
+
+    return result
+
+
+# ─────────────────────────── TTS WITH WORD TIMING ─────────────────────────────
+
+async def generate_tts_with_word_timings(text: str, voice: str, out_path: str) -> list[dict]:
+    """
+    Stream TTS audio and collect WordBoundary events.
+    Uses clean_for_tts(text) to strip emoji before sending to edge_tts,
+    so word-boundary events contain proper words instead of character spans.
+    """
+    tts_text = clean_for_tts(text)
+    if not tts_text:
+        return []
+    word_timings = []
+    audio_bytes = bytearray()
+
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(tts_text, voice, boundary="WordBoundary")
+            word_timings.clear()
+            audio_bytes.clear()
+
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_bytes.extend(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    # offset and duration are in 100-nanosecond units
+                    offset_s = chunk["offset"] / 1e7
+                    duration_s = chunk["duration"] / 1e7
+                    word = chunk.get("text", "")
+                    word_timings.append({
+                        "offset_s": offset_s,
+                        "duration_s": duration_s,
+                        "word": word,
+                    })
+
+            if audio_bytes:
+                with open(out_path, "wb") as f:
+                    f.write(audio_bytes)
+                return word_timings
+
+        except Exception:
+            await asyncio.sleep(0.5)
+
+    return []
+
+
+async def generate_tts_chunk(text: str, voice: str, out_path: str) -> bool:
+    """Generate a single TTS mp3 chunk (audio only). Returns True on success."""
+    tts_text = clean_for_tts(text)
+    if not tts_text:
+        return False
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(tts_text, voice)
+            await communicate.save(out_path)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return True
+        except Exception:
+            await asyncio.sleep(0.5)
+    return False
 
 
 # ─────────────────────────── VIDEO HELPERS ────────────────────────────────────
@@ -87,19 +230,47 @@ def extract_paragraphs_pdf_with_pos(filepath: str) -> list[tuple]:
     doc = fitz.open(filepath)
     for page_idx, page in enumerate(doc):
         blocks = page.get_text("blocks")
-        for block in blocks:
-            # block = (x0, y0, x1, y1, "text", block_no, block_type)
-            text = " ".join(block[4].strip().splitlines()).strip()
+        merged = merge_pdf_blocks(blocks)
+        for (x0, y0, x1, y1, text) in merged:
             if is_valid_text(text):
-                rect = fitz.Rect(block[0], block[1], block[2], block[3])
+                rect = fitz.Rect(x0, y0, x1, y1)
                 results.append((text, page_idx, rect, doc))
     return results
 
 
-def render_page_pdf_image(pdf_doc, page_idx: int, highlight_rect=None, target_w: int = VIDEO_W, target_h: int = VIDEO_H):
+def get_pdf_word_rects(pdf_doc, page_idx: int, para_rect: fitz.Rect) -> list[tuple]:
+    """
+    Return list of (word_text, fitz.Rect) for words within para_rect on page_idx.
+    Uses fitz word-level extraction.
+    """
+    page = pdf_doc[page_idx]
+    # get_text("words") returns (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+    words = page.get_text("words")
+    result = []
+    for w in words:
+        word_rect = fitz.Rect(w[0], w[1], w[2], w[3])
+        word_text = w[4]
+        # Skip words that are pure emoji / symbols (TTS won't produce word-boundaries for them)
+        if not any(c.isalpha() or c.isdigit() for c in word_text):
+            continue
+        # Only include words that intersect with the paragraph block
+        if word_rect.intersects(para_rect):
+            result.append((word_text, word_rect))
+    return result
+
+
+def render_page_pdf_image(
+    pdf_doc,
+    page_idx: int,
+    highlight_rect=None,
+    word_highlight_rect=None,
+    target_w: int = VIDEO_W,
+    target_h: int = VIDEO_H,
+):
     """
     Render a PDF page as a PIL RGBA image sized to fit target_w x target_h.
-    Optionally draw a highlight rectangle over `highlight_rect` (fitz.Rect).
+    - highlight_rect: paragraph-level semi-transparent highlight (fitz.Rect)
+    - word_highlight_rect: word-level bright highlight (fitz.Rect), drawn on top
     Returns a PIL Image (RGB).
     """
     from PIL import Image, ImageDraw
@@ -118,35 +289,116 @@ def render_page_pdf_image(pdf_doc, page_idx: int, highlight_rect=None, target_w:
     y_off = (target_h - img.height) // 2
     canvas.paste(img, (x_off, y_off))
 
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    def scaled_rect(r):
+        return (
+            int(r.x0 * scale) + x_off,
+            int(r.y0 * scale) + y_off,
+            int(r.x1 * scale) + x_off,
+            int(r.y1 * scale) + y_off,
+        )
+
+    # Paragraph-level backdrop highlight (very faint)
     if highlight_rect is not None:
-        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        hx0 = int(highlight_rect.x0 * scale) + x_off
-        hy0 = int(highlight_rect.y0 * scale) + y_off
-        hx1 = int(highlight_rect.x1 * scale) + x_off
-        hy1 = int(highlight_rect.y1 * scale) + y_off
-        # Semi-transparent yellow fill
-        draw.rectangle([hx0, hy0, hx1, hy1], fill=(255, 220, 0, 80))
-        # Solid orange border
-        draw.rectangle([hx0, hy0, hx1, hy1], outline=(255, 140, 0, 230), width=3)
-        canvas = canvas.convert("RGBA")
-        canvas = Image.alpha_composite(canvas, overlay).convert("RGB")
+        hx0, hy0, hx1, hy1 = scaled_rect(highlight_rect)
+        draw.rectangle([hx0, hy0, hx1, hy1], fill=(57, 255, 20, 30))
+        draw.rectangle([hx0, hy0, hx1, hy1], outline=(57, 255, 20, 80), width=2)
+
+    # Word-level highlight (bright on top)
+    if word_highlight_rect is not None:
+        wx0, wy0, wx1, wy1 = scaled_rect(word_highlight_rect)
+        draw.rectangle([wx0, wy0, wx1, wy1], fill=(57, 255, 20, 120))
+        draw.rectangle([wx0, wy0, wx1, wy1], outline=(57, 255, 20, 255), width=3)
+
+    canvas = canvas.convert("RGBA")
+    canvas = Image.alpha_composite(canvas, overlay).convert("RGB")
 
     return canvas
 
 
-def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: int = VIDEO_W, target_h: int = VIDEO_H):
+def _build_docx_layout(text: str, box_w: int, box_h: int):
     """
-    Render a DOCX paragraph as a PIL Image (fallback renderer — no Word needed).
-    Shows the paragraph text with a highlighted background box, and a header
-    showing current / total paragraphs.
+    Compute line wrapping and best font size for DOCX renderer.
+    Returns (best_lines, best_font, line_h, font_size).
+    """
+    from PIL import ImageFont
+
+    def try_wrap(font_sz):
+        try:
+            font = ImageFont.truetype("arial.ttf", size=font_sz)
+        except Exception:
+            font = ImageFont.load_default()
+            font_sz = 14
+
+        words = text.split()
+        if not words:
+            return ["(κενή παράγραφος)"], font, font_sz
+
+        lines = []
+        current_line = []
+        for word in words:
+            test_line = " ".join(current_line + [word])
+            w = font.getbbox(test_line)[2] if hasattr(font, 'getbbox') else font.getsize(test_line)[0]
+            if w <= box_w:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                    current_line = [word]
+                else:
+                    lines.append(word)
+                    current_line = []
+        if current_line:
+            lines.append(" ".join(current_line))
+
+        return lines, font, font_sz
+
+    best_lines = []
+    best_font = None
+    best_font_size = 50
+    line_h = 50
+
+    for f_size in range(50, 15, -2):
+        lines, font, actual_f_size = try_wrap(f_size)
+        test_line_h = max(22, int(actual_f_size * 1.5))
+        total_h = len(lines) * test_line_h
+
+        if total_h <= box_h or f_size == 16:
+            best_lines = lines
+            best_font = font
+            best_font_size = actual_f_size
+            line_h = test_line_h
+            break
+
+    if not best_lines:
+        best_lines, best_font, best_font_size = try_wrap(24)
+        line_h = 36
+
+    return best_lines, best_font, line_h, best_font_size
+
+
+def render_docx_paragraph_image(
+    text: str,
+    para_idx: int,
+    total: int,
+    highlight_word: str = None,
+    target_w: int = VIDEO_W,
+    target_h: int = VIDEO_H,
+):
+    """
+    Render a DOCX paragraph as a PIL Image.
+    - If highlight_word is given, that specific word (first occurrence on screen) is
+      highlighted in bright fluorescent green; the rest of the text box has a dimmer backdrop.
+    - Otherwise falls back to the full-paragraph highlight.
     Returns a PIL Image (RGB).
     """
     from PIL import Image, ImageDraw, ImageFont
 
     BG = (24, 28, 42)
     HEADER_BG = (40, 44, 64)
-    HIGHLIGHT = (255, 220, 0)
+    H_COLOR = HIGHLIGHT_COLOR          # (57, 255, 20)
     TEXT_COLOR = (30, 30, 30)
     HEADER_COLOR = (180, 180, 200)
 
@@ -168,83 +420,79 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
     box_x = 60
     box_y = 90
 
-    # Auto-fit font size and wrapping
-    def try_wrap(font_sz):
-        try:
-            font = ImageFont.truetype("arial.ttf", size=font_sz)
-        except Exception:
-            font = ImageFont.load_default()
-            font_sz = 14  # Default fallback
+    best_lines, best_font, line_h, font_size = _build_docx_layout(text, box_w, box_h)
 
-        words = text.split()
-        if not words:
-            return ["(κενή παράγραφος)"], font, font_sz
-
-        lines = []
-        current_line = []
-        for word in words:
-            test_line = " ".join(current_line + [word])
-            # getbbox returns (left, top, right, bottom)
-            w = font.getbbox(test_line)[2] if hasattr(font, 'getbbox') else font.getsize(test_line)[0]
-            if w <= box_w:
-                current_line.append(word)
-            else:
-                if current_line:
-                    lines.append(" ".join(current_line))
-                    current_line = [word]
-                else:
-                    # Word itself is wider than the box
-                    lines.append(word)
-                    current_line = []
-        if current_line:
-            lines.append(" ".join(current_line))
-            
-        return lines, font, font_sz
-
-    # Binary search or simple step-down for best font size
-    best_lines = []
-    best_font = None
-    best_font_size = 50
-    line_h = 50
-
-    for f_size in range(50, 15, -2):
-        lines, font, actual_f_size = try_wrap(f_size)
-        
-        # Estimate height block
-        test_line_h = max(22, int(actual_f_size * 1.5))
-        total_h = len(lines) * test_line_h
-        
-        if total_h <= box_h or f_size == 16:
-            best_lines = lines
-            best_font = font
-            best_font_size = actual_f_size
-            line_h = test_line_h
-            break
-
-    if not best_lines: # fallback
-        best_lines, best_font, best_font_size = try_wrap(24)
-        line_h = 36
-
-    # Draw highlight box
+    # Compute overall text block dimensions
     text_block_h = len(best_lines) * line_h + 40
-    # Calculate real max width of wrapped lines
     max_line_w = 0
     for line in best_lines:
         w = best_font.getbbox(line)[2] if hasattr(best_font, 'getbbox') else best_font.getsize(line)[0]
         max_line_w = max(max_line_w, w)
-    
-    # Cap block width at box_w
     text_block_w = min(max_line_w + 40, box_w + 40)
-    
+
     tx = box_x - 20
     ty = box_y - 10
-    draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], fill=HIGHLIGHT)
-    draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], outline=(255, 140, 0), width=4)
 
-    # Draw text lines
+    if highlight_word:
+        # Draw a dim backdrop for the whole paragraph box
+        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
+                       fill=(30, 80, 30))
+        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
+                       outline=(0, 120, 0), width=2)
+    else:
+        # Full bright highlight (original behaviour)
+        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], fill=H_COLOR)
+        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], outline=(0, 200, 0), width=4)
+
+    # Draw text lines and find word bounding box
     y_cursor = box_y + 10
+    word_rect_found = None  # (x0, y0, x1, y1) on canvas
+
+    # Normalize highlight_word for comparison (strip punctuation)
+    def normalize(w):
+        return w.strip(".,;:!?\"'()[]»«—–-").lower() if w else ""
+
+    norm_hw = normalize(highlight_word)
+    word_found = False
+
     for line in best_lines:
-        draw.text((box_x + 10, y_cursor), line, font=best_font, fill=TEXT_COLOR)
+        line_words = line.split()
+        x_cursor = box_x + 10
+
+        for lw in line_words:
+            # Measure this word
+            if hasattr(best_font, 'getbbox'):
+                wb = best_font.getbbox(lw)
+                w_width = wb[2] - wb[0]
+                w_height = wb[3] - wb[1]
+            else:
+                w_width, w_height = best_font.getsize(lw)
+                wb = (0, 0, w_width, w_height)
+
+            # Draw the word
+            if highlight_word and not word_found and normalize(lw) == norm_hw:
+                # Highlight this word
+                pad = 4
+                hx0 = x_cursor - pad
+                hy0 = y_cursor - pad
+                hx1 = x_cursor + w_width + pad
+                hy1 = y_cursor + line_h - 2
+                draw.rectangle([hx0, hy0, hx1, hy1], fill=H_COLOR)
+                draw.rectangle([hx0, hy0, hx1, hy1], outline=(0, 220, 0), width=2)
+                draw.text((x_cursor, y_cursor), lw, font=best_font, fill=TEXT_COLOR)
+                word_found = True
+            else:
+                # Normal text (white-ish on dark backdrop when word mode)
+                txt_col = (200, 220, 200) if highlight_word else TEXT_COLOR
+                draw.text((x_cursor, y_cursor), lw, font=best_font, fill=txt_col)
+
+            # Advance x by word width + space width
+            if hasattr(best_font, 'getbbox'):
+                space_w = best_font.getbbox(" ")[2]
+            else:
+                space_w = best_font.getsize(" ")[0]
+            x_cursor += w_width + space_w
+
         y_cursor += line_h
         if y_cursor > box_y + box_h:
             break
@@ -254,7 +502,8 @@ def render_docx_paragraph_image(text: str, para_idx: int, total: int, target_w: 
     footer_txt = "Spyken · MP4 by spyalekos"
     try:
         footer_font = ImageFont.truetype("arial.ttf", size=18)
-        draw.text((target_w // 2, target_h - 20), footer_txt, font=footer_font, fill=(100, 100, 130), anchor="mm")
+        draw.text((target_w // 2, target_h - 20), footer_txt,
+                  font=footer_font, fill=(100, 100, 130), anchor="mm")
     except Exception:
         draw.text((target_w // 2, target_h - 20), footer_txt, fill=(100, 100, 130), anchor="mm")
 
@@ -271,23 +520,45 @@ def get_mp3_duration(path: str) -> float:
         return 3.0  # fallback
 
 
-async def generate_tts_chunk(text: str, voice: str, out_path: str) -> bool:
-    """Generate a single TTS mp3 chunk. Returns True on success."""
-    for attempt in range(3):
-        try:
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(out_path)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                return True
-        except Exception:
-            await asyncio.sleep(0.5)
-    return False
+# ─────────────────────── WORD-TIMING ALIGNMENT ────────────────────────────────
+
+def align_word_timings_to_text(word_timings: list[dict], text: str) -> list[dict]:
+    """
+    The TTS engine may return WordBoundary words in a slightly different order
+    or with punctuation stripped. We do a best-effort match of timing words
+    to the actual words in `text` so that highlights correspond to visible tokens.
+
+    Returns same list but with an extra 'text_word' key containing the original
+    word from the text (or same as 'word' if no match found).
+    """
+    text_words = text.split()
+    timing_words = [t.copy() for t in word_timings]
+
+    t_idx = 0
+    for tw in timing_words:
+        # Advance text_words pointer to find the best match
+        norm_tw = tw["word"].strip(".,;:!?\"'()[]»«—–-").lower()
+        matched = False
+        for offset in range(min(12, len(text_words) - t_idx)):
+            candidate = text_words[t_idx + offset].strip(".,;:!?\"'()[]»«—–-").lower()
+            if candidate == norm_tw or (
+                norm_tw and candidate and (norm_tw in candidate or candidate in norm_tw)
+            ):
+                tw["text_word"] = text_words[t_idx + offset]
+                t_idx = t_idx + offset + 1
+                matched = True
+                break
+        if not matched:
+            tw["text_word"] = tw["word"]
+
+    return timing_words
 
 
 async def convert_to_video(filepath: str, output_path: str, progress_callback):
     """
     Master function: extract paragraphs (with positions for PDF),
-    generate TTS per paragraph, build video frames, assemble mp4.
+    generate TTS per paragraph with word timings, build per-word video frames,
+    assemble mp4.
     """
     import numpy as np
     from moviepy import ImageClip, AudioFileClip, concatenate_videoclips, concatenate_audioclips
@@ -316,10 +587,10 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             para_data = []  # (text, page_idx, rect)
             for page_idx, page in enumerate(pdf_doc):
                 blocks = page.get_text("blocks")
-                for block in blocks:
-                    text = " ".join(block[4].strip().splitlines()).strip()
+                merged = merge_pdf_blocks(blocks)
+                for (x0, y0, x1, y1, text) in merged:
                     if is_valid_text(text):
-                        rect = fitz.Rect(block[0], block[1], block[2], block[3])
+                        rect = fitz.Rect(x0, y0, x1, y1)
                         para_data.append((text, page_idx, rect))
         else:  # docx
             doc_obj = docx.Document(filepath)
@@ -336,10 +607,10 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
         clips = []
         voice_index = 0
 
-        # ── 2. Per-paragraph: TTS + frame ─────────────────────────────────────
+        # ── 2. Per-paragraph: TTS with word timings + frames ──────────────────
         for i, para_item in enumerate(para_data):
             text = para_item[0]
-            progress_callback(i, total, f"Παράγραφος {i+1}/{total}: TTS…")
+            progress_callback(i, total, f"Παράγραφος {i+1}/{total}: TTS + λέξεις…")
             await asyncio.sleep(0)  # yield to UI
 
             # Pick voice
@@ -349,60 +620,194 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
             )
 
-            # For long paragraphs, generate TTS for all chunks and concatenate their audio
+            # For long paragraphs we chunk the text
             chunks = chunk_text(text, 800)
             chunk_audio_clips = []
-            
+            all_word_timings = []     # accumulated across chunks
+            chunk_time_offset = 0.0  # running time offset for multi-chunk paragraphs
+
             for c_idx, chunk in enumerate(chunks):
                 chunk_audio_path = os.path.join(temp_dir, f"audio_{i}_{c_idx}.mp3")
-                ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
-                if ok:
-                    chunk_audio_clips.append(AudioFileClip(chunk_audio_path))
+                word_timings = await generate_tts_with_word_timings(chunk, voice, chunk_audio_path)
+
+                if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 0:
+                    ac = AudioFileClip(chunk_audio_path)
+                    chunk_audio_clips.append(ac)
+
+                    # Shift word timings by the running offset
+                    for wt in word_timings:
+                        shifted = dict(wt)
+                        shifted["offset_s"] += chunk_time_offset
+                        all_word_timings.append(shifted)
+
+                    chunk_time_offset += ac.duration
+                else:
+                    # Fallback: plain TTS without timings
+                    ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
+                    if ok:
+                        ac = AudioFileClip(chunk_audio_path)
+                        chunk_audio_clips.append(ac)
+                        chunk_time_offset += ac.duration
 
             if chunk_audio_clips:
                 if len(chunk_audio_clips) == 1:
                     combined_audio = chunk_audio_clips[0]
                 else:
                     combined_audio = concatenate_audioclips(chunk_audio_clips)
-                duration = combined_audio.duration
+                total_duration = combined_audio.duration
                 voice_index += 1
             else:
                 combined_audio = None
-                duration = 3.0
+                total_duration = 3.0
 
-            # ── 3. Render frame ───────────────────────────────────────────────
-            progress_callback(i, total, f"Παράγραφος {i+1}/{total}: Εικόνα…")
+            # ── 3. Align word timings to actual text ──────────────────────────
+            if all_word_timings:
+                all_word_timings = align_word_timings_to_text(all_word_timings, text)
+
+            # ── 4. Build per-word frames ───────────────────────────────────────
+            progress_callback(i, total, f"Παράγραφος {i+1}/{total}: Frames…")
             await asyncio.sleep(0)
 
-            if ext == 'pdf':
-                _, page_idx, rect = para_item
-                frame_img = render_page_pdf_image(pdf_doc, page_idx, highlight_rect=rect)
+            # Pre-fetch PDF word rects (only for PDF with word timings)
+            pdf_word_rects = []
+            if ext == 'pdf' and all_word_timings:
+                _, page_idx, para_rect = para_item
+                pdf_word_rects = get_pdf_word_rects(pdf_doc, page_idx, para_rect)
+
+            para_clips = []
+
+            if all_word_timings:
+                # ── Word-level frame generation ───────────────────────────────
+
+                # For PDF: pre-render the base page image ONCE (no highlight),
+                # then composite word highlights on top.
+                # This avoids re-rendering the full page for every word.
+                if ext == 'pdf':
+                    _, page_idx, para_rect = para_item
+                    base_pdf_img = render_page_pdf_image(
+                        pdf_doc,
+                        page_idx,
+                        highlight_rect=para_rect,
+                        word_highlight_rect=None,
+                    )
+                    # Normalise word rects for this page (scale + offset)
+                    page = pdf_doc[page_idx]
+                    page_rect = page.rect
+                    scale = min(VIDEO_W / page_rect.width, VIDEO_H / page_rect.height)
+                    x_off = (VIDEO_W - int(page_rect.width * scale)) // 2
+                    y_off = (VIDEO_H - int(page_rect.height * scale)) // 2
+
+                    # Sequential pointer into pdf_word_rects
+                    wr_ptr = 0
+
+                    # Pre-roll: blank (no word highlight) frame before first word
+                    first_offset = all_word_timings[0]["offset_s"]
+                    if first_offset > 0.05:
+                        para_clips.append(ImageClip(np.array(base_pdf_img), duration=first_offset))
+
+                else:
+                    # DOCX pre-roll
+                    _, para_idx, _ = para_item
+                    first_offset = all_word_timings[0]["offset_s"]
+                    if first_offset > 0.05:
+                        pre_frame = render_docx_paragraph_image(text, para_idx, total)
+                        para_clips.append(ImageClip(np.array(pre_frame), duration=first_offset))
+
+                n_timings = len(all_word_timings)
+                for w_idx, wt in enumerate(all_word_timings):
+                    # Clip duration = gap to next word's offset (covers silence between words)
+                    if w_idx < n_timings - 1:
+                        clip_dur = all_word_timings[w_idx + 1]["offset_s"] - wt["offset_s"]
+                    else:
+                        clip_dur = total_duration - wt["offset_s"]
+                    if clip_dur < 0.04:
+                        clip_dur = 0.04
+
+                    word_text = wt.get("text_word", wt["word"])
+
+                    if ext == 'pdf':
+                        # Sequential search: advance wr_ptr instead of restarting
+                        norm_word = word_text.strip(".,;:!?\"'()[]\u00bb\u00ab\u2014\u2013-").lower()
+                        matching_rect = None
+                        search_limit = min(wr_ptr + 20, len(pdf_word_rects))
+                        for j in range(wr_ptr, search_limit):
+                            wr_text, wr_rect = pdf_word_rects[j]
+                            wr_norm = wr_text.strip(".,;:!?\"'()[]\u00bb\u00ab\u2014\u2013-").lower()
+                            if wr_norm == norm_word or (
+                                wr_norm and norm_word and
+                                (norm_word in wr_norm or wr_norm in norm_word)
+                            ):
+                                matching_rect = wr_rect
+                                wr_ptr = j + 1  # advance past this word
+                                break
+                        else:
+                            # No match found — advance ptr by 1 to avoid stalling
+                            if wr_ptr < len(pdf_word_rects):
+                                wr_ptr += 1
+
+                        # Composite highlight onto cached base image
+                        from PIL import Image, ImageDraw
+                        frame_img = base_pdf_img.copy()
+                        if matching_rect is not None:
+                            overlay = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0, 0, 0, 0))
+                            draw = ImageDraw.Draw(overlay)
+                            wx0 = int(matching_rect.x0 * scale) + x_off
+                            wy0 = int(matching_rect.y0 * scale) + y_off
+                            wx1 = int(matching_rect.x1 * scale) + x_off
+                            wy1 = int(matching_rect.y1 * scale) + y_off
+                            draw.rectangle([wx0, wy0, wx1, wy1], fill=(57, 255, 20, 140))
+                            draw.rectangle([wx0, wy0, wx1, wy1],
+                                           outline=(57, 255, 20, 255), width=3)
+                            frame_img = Image.alpha_composite(
+                                frame_img.convert("RGBA"), overlay
+                            ).convert("RGB")
+                    else:
+                        _, para_idx, _ = para_item
+                        frame_img = render_docx_paragraph_image(
+                            text, para_idx, total,
+                            highlight_word=word_text,
+                        )
+
+                    frame_np = np.array(frame_img)
+                    para_clips.append(ImageClip(frame_np, duration=clip_dur))
+
+                # No gap-fill needed: offset-based durations already cover total_duration
+
             else:
-                _, para_idx, _ = para_item
-                frame_img = render_docx_paragraph_image(text, para_idx, total)
+                # ── Fallback: paragraph-level (original behaviour) ────────────
+                if ext == 'pdf':
+                    _, page_idx, rect = para_item
+                    frame_img = render_page_pdf_image(pdf_doc, page_idx, highlight_rect=rect)
+                else:
+                    _, para_idx, _ = para_item
+                    frame_img = render_docx_paragraph_image(text, para_idx, total)
 
-            frame_np = np.array(frame_img)
+                frame_np = np.array(frame_img)
+                para_clips.append(ImageClip(frame_np, duration=total_duration if total_duration else 3.0))
 
-            # ── 4. Build clip ─────────────────────────────────────────────────
-            img_clip = ImageClip(frame_np, duration=duration)
+            # ── 5. Concatenate word clips → paragraph clip ─────────────────────
+            if len(para_clips) == 1:
+                para_video = para_clips[0]
+            else:
+                para_video = concatenate_videoclips(para_clips, method="compose")
 
             if combined_audio:
-                # Need to explicitly set duration on the audio clip, 
-                # though concatenate_audioclips does this usually.
-                if combined_audio.duration > duration:
-                    combined_audio = combined_audio.subclipped(0, duration)
-                img_clip = img_clip.with_audio(combined_audio)
+                audio_dur = combined_audio.duration
+                video_dur = para_video.duration
+                if audio_dur > video_dur:
+                    combined_audio = combined_audio.subclipped(0, video_dur)
+                para_video = para_video.with_audio(combined_audio)
 
-            clips.append(img_clip)
+            clips.append(para_video)
 
-        # ── 5. Assemble final video ────────────────────────────────────────────
+        # ── 6. Assemble final video ────────────────────────────────────────────
         progress_callback(total, total, "Συναρμολόγηση βίντεο...")
         await asyncio.sleep(0)
 
         ui_logger = FletMoviepyLogger(progress_callback)
 
         final = concatenate_videoclips(clips, method="compose")
-        
+
         def _write_video():
             final.write_videofile(
                 output_path,
@@ -414,7 +819,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 logger=ui_logger,
             )
             final.close()
-            
+
         await asyncio.to_thread(_write_video)
 
     finally:
@@ -487,7 +892,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.01"
+    APP_VERSION = "1.5.0"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -634,7 +1039,8 @@ def main(page: ft.Page):
                     ft.Text(
                         "Το Spyken μετατρέπει αρχεία .docx και .pdf σε αρχεία ήχου .mp3 "
                         "εναλλάσσοντας ανδρική και γυναικεία φωνή για κάθε παράγραφο, "
-                        "καθώς και σε βίντεο .mp4 με οπτική ανάδειξη (highlight) κάθε παραγράφου.",
+                        "καθώς και σε βίντεο .mp4 με οπτική ανάδειξη (highlight) "
+                        "κάθε λέξης καθώς εκφωνείται.",
                         size=14, color=ft.Colors.GREY_300
                     ),
                     ft.Divider(height=10, color=ft.Colors.WHITE24),
