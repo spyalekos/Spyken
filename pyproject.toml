@@ -1,0 +1,22 @@
+[project]
+name = "spyken"
+version = "1.5.6"
+description = "Flet application for synced audio and video marquee generation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "flet",
+    "edge-tts",
+    "python-docx",
+    "pymupdf",
+    "moviepy",
+    "mutagen",
+    "pillow",
+    "imageio",
+    "imageio-ffmpeg",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller",
+]
