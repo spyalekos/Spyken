@@ -1257,7 +1257,7 @@ def main(page: ft.Page):
     page.window.height = 740
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 30
-    page.window.center()
+    page.run_task(page.window.center)
 
     # UI Elements
     selected_files_list = ft.ListView(expand=1, spacing=10, padding=20, auto_scroll=True)
@@ -1491,35 +1491,35 @@ def main(page: ft.Page):
 
     # ── Buttons ───────────────────────────────────────────────────────────────
 
-    pick_btn = ft.ElevatedButton(
+    pick_btn = ft.Button(
         "Επιλογή Αρχείων (.docx, .pdf)",
         icon=ft.Icons.FOLDER_OPEN,
         on_click=pick_files_clicked,
         style=ft.ButtonStyle(bgcolor=ft.Colors.INDIGO_700, color=ft.Colors.WHITE)
     )
 
-    clear_btn = ft.ElevatedButton(
+    clear_btn = ft.Button(
         "Καθαρισμός Λίστας",
         icon=ft.Icons.CLEAR,
         on_click=clear_files,
         style=ft.ButtonStyle(bgcolor=ft.Colors.RED_900, color=ft.Colors.WHITE)
     )
 
-    convert_btn = ft.ElevatedButton(
+    convert_btn = ft.Button(
         "Μετατροπή σε MP3",
         icon=ft.Icons.AUDIOTRACK,
         on_click=start_conversion,
         style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE)
     )
 
-    video_btn = ft.ElevatedButton(
+    video_btn = ft.Button(
         "Μετατροπή σε MP4",
         icon=ft.Icons.VIDEO_FILE,
         on_click=start_video_conversion,
         style=ft.ButtonStyle(bgcolor=ft.Colors.PURPLE_700, color=ft.Colors.WHITE)
     )
 
-    marquee_btn = ft.ElevatedButton(
+    marquee_btn = ft.Button(
         "Marquee Video",
         icon=ft.Icons.SUBTITLES,
         on_click=start_marquee_conversion,
@@ -1554,7 +1554,7 @@ def main(page: ft.Page):
                 button_row_top,
                 ft.Container(
                     content=selected_files_list,
-                    border=ft.border.all(1, ft.Colors.WHITE24),
+                    border=ft.Border.all(1, ft.Colors.WHITE24),
                     border_radius=10,
                     padding=10,
                     expand=True
@@ -1573,4 +1573,4 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)
