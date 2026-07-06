@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import copy_metadata
 datas  = copy_metadata('imageio')
 datas += copy_metadata('imageio-ffmpeg')
 datas += copy_metadata('moviepy')
+datas += [('assets/*', 'assets')]
 
 a = Analysis(
     ['main.py'],

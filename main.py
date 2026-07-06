@@ -4,8 +4,14 @@ import docx
 import edge_tts
 import asyncio
 import os
+import sys
 import tempfile
 import textwrap
+
+def get_asset_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 VOICE_MALE = "el-GR-NestorasNeural"
 VOICE_FEMALE = "el-GR-AthinaNeural"
@@ -1251,13 +1257,50 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.5.6"
+    APP_VERSION = "1.5.7"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 30
     page.run_task(page.window.center)
+
+    # ── Splash Screen ─────────────────────────────────────────────────────────
+    splash_image_path = get_asset_path(os.path.join("assets", "spyken_splash.jpg"))
+    splash_image = ft.Image(
+        src=splash_image_path,
+        width=300,
+        height=300,
+        fit="contain",
+    )
+    
+    splash_text = ft.Text(
+        "Φόρτωση εφαρμογής...",
+        size=16,
+        color=ft.Colors.AMBER_400,
+        weight=ft.FontWeight.BOLD,
+    )
+    
+    splash_progress = ft.ProgressBar(width=300, color="amber", bgcolor="#263238")
+    
+    splash_container = ft.Container(
+        content=ft.Column(
+            [
+                splash_image,
+                ft.Divider(height=10, color="transparent"),
+                splash_text,
+                ft.Divider(height=5, color="transparent"),
+                splash_progress
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            alignment=ft.MainAxisAlignment.CENTER,
+        ),
+        alignment=ft.Alignment(0, 0),
+        expand=True
+    )
+    
+    page.add(splash_container)
+    page.update()
 
     # UI Elements
     selected_files_list = ft.ListView(expand=1, spacing=10, padding=20, auto_scroll=True)
@@ -1569,7 +1612,13 @@ def main(page: ft.Page):
         expand=True
     )
 
-    page.add(main_container)
+    async def load_app():
+        await asyncio.sleep(2.5)
+        page.clean()
+        page.add(main_container)
+        page.update()
+
+    page.run_task(load_app)
 
 
 if __name__ == "__main__":
