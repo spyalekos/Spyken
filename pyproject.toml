@@ -1,6 +1,6 @@
 [project]
 name = "spyken"
-version = "1.5.8"
+version = "1.5.9"
 description = "Flet application for synced audio and video marquee generation"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -1257,7 +1257,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.5.8"
+    APP_VERSION = "1.5.9"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -1587,5 +1587,87 @@ def main(page: ft.Page):
         pass
 
 
+def play_audio_windows(file_path: str):
+    import ctypes
+    import time
+    
+    abs_path = os.path.abspath(file_path)
+    alias = f"spyken_play_{os.getpid()}"
+    open_cmd = f'open "{abs_path}" type mpegvideo alias {alias}'
+    
+    res = ctypes.windll.winmm.mciSendStringW(open_cmd, None, 0, 0)
+    if res != 0:
+        return False
+        
+    try:
+        play_cmd = f'play {alias}'
+        res = ctypes.windll.winmm.mciSendStringW(play_cmd, None, 0, 0)
+        if res != 0:
+            return False
+            
+        buffer = ctypes.create_unicode_buffer(128)
+        while True:
+            res = ctypes.windll.winmm.mciSendStringW(f'status {alias} mode', buffer, 128, 0)
+            if res != 0:
+                break
+            mode = buffer.value.strip()
+            if mode != 'playing':
+                break
+            time.sleep(0.05)
+            
+    finally:
+        ctypes.windll.winmm.mciSendStringW(f'close {alias}', None, 0, 0)
+        
+    return True
+
+
+async def run_cli_async(text: str):
+    voice = VOICE_EN_FEMALE if is_english(text) else VOICE_FEMALE
+    print(f"Εκφώνηση: \"{text}\"")
+    print(f"Φωνή: {voice}")
+    
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"spyken_cli_temp_{os.getpid()}.mp3")
+    
+    try:
+        print("Δημιουργία αρχείου ήχου...")
+        ok = await generate_tts_chunk(text, voice, temp_path)
+        if ok and os.path.exists(temp_path):
+            print("Αναπαραγωγή...")
+            play_audio_windows(temp_path)
+            print("Ολοκληρώθηκε.")
+        else:
+            print("Σφάλμα: Αποτυχία δημιουργίας αρχείου ήχου μέσω Edge TTS.")
+    except Exception as e:
+        print(f"Σφάλμα κατά την εκτέλεση: {e}")
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        # Close PyInstaller Splash screen immediately if running from command line
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except ImportError:
+            pass
+            
+        text_arg = " ".join(sys.argv[1:])
+        if text_arg.strip().lower() in ("--help", "-h", "/h", "/help"):
+            print("Spyken - Text to Speech & Video Generator")
+            print("Χρήση μέσω γραμμής εντολών:")
+            print("  spyken.exe \"Κείμενο προς εκφώνηση\"")
+            print("Παράδειγμα:")
+            print("  spyken.exe \"Καλημέρα, καλή εβδομάδα και καλό μήνα\"")
+            sys.exit(0)
+            
+        if text_arg.strip():
+            asyncio.run(run_cli_async(text_arg))
+            sys.exit(0)
+            
     ft.run(main)
