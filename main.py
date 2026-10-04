@@ -22,6 +22,7 @@ VOICE_EN_FEMALE = "en-GB-SoniaNeural"
 VIDEO_W = 1280
 VIDEO_H = 720
 VIDEO_FPS = 10  # Reduced from 24 to speed up rendering significantly
+VIDEO_TAIL_BUFFER_SEC = 1.5  # Freeze-frame buffer at the end of video for clear readability
 
 # Marquee video frame resolution (horizontal banner, 1/10 of screen height)
 MARQUEE_W = 1920
@@ -860,7 +861,8 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                         return make_frame
 
                     pdf_f = create_pdf_frame_func(word_rect_timings, base_pdf_img, scale, x_off, y_off)
-                    para_clips.append(VideoClip(pdf_f, duration=total_duration))
+                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                    para_clips.append(VideoClip(pdf_f, duration=para_clip_duration))
 
                 else:
                     # ── DOCX Lazy Rendering ───────────────────────────────────
@@ -906,7 +908,8 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                         return make_frame_docx
 
                     docx_f = create_docx_frame_func(word_render_timings, text, para_idx, total)
-                    para_clips.append(VideoClip(docx_f, duration=total_duration))
+                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                    para_clips.append(VideoClip(docx_f, duration=para_clip_duration))
 
                 # No gap-fill needed: offset-based durations already cover total_duration
 
@@ -920,7 +923,8 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                     frame_img = render_docx_paragraph_image(text, para_idx, total)
 
                 frame_np = np.array(frame_img.convert("RGB"))
-                para_clips.append(ImageClip(frame_np, duration=total_duration if total_duration else 3.0))
+                para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                para_clips.append(ImageClip(frame_np, duration=para_clip_duration if para_clip_duration else 3.0))
 
             # ── 5. Concatenate word clips → paragraph clip ─────────────────────
             # (Note: para_clips now contains a single VideoClip for word-level, 
@@ -931,6 +935,10 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 para_video = concatenate_videoclips(para_clips, method="chain")
 
             if combined_audio:
+                if i == total - 1 and VIDEO_TAIL_BUFFER_SEC > 0:
+                    from moviepy import AudioArrayClip
+                    silence = AudioArrayClip(np.zeros((int(44100 * VIDEO_TAIL_BUFFER_SEC), 2)), fps=44100)
+                    combined_audio = concatenate_audioclips([combined_audio, silence])
                 audio_dur = combined_audio.duration
                 video_dur = para_video.duration
                 if audio_dur > video_dur:
@@ -1100,11 +1108,18 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
         if total_duration < 0.1:
             raise ValueError("Δεν παρήχθη ήχος.")
 
-        # 4. Combine all audio clips
+        # 4. Combine all audio clips + tail silence
+        if VIDEO_TAIL_BUFFER_SEC > 0:
+            from moviepy import AudioArrayClip
+            silence = AudioArrayClip(np.zeros((int(44100 * VIDEO_TAIL_BUFFER_SEC), 2)), fps=44100)
+            all_audio_clips.append(silence)
+
         if len(all_audio_clips) == 1:
             final_audio = all_audio_clips[0]
         else:
             final_audio = concatenate_audioclips(all_audio_clips)
+
+        final_video_duration = total_duration + VIDEO_TAIL_BUFFER_SEC
 
         # 5. Build video with make_frame (scrolling viewport + word highlight)
         progress_callback(total_paras, total_paras, "Δημιουργία marquee frames…")
@@ -1168,7 +1183,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
             all_timed_words, virtual_img, wp_by_idx,
             canvas_width, total_duration, font,
         )
-        video_clip = VideoClip(marquee_f, duration=total_duration)
+        video_clip = VideoClip(marquee_f, duration=final_video_duration)
         video_clip = video_clip.with_audio(final_audio)
 
         # 6. Write final video
@@ -1257,7 +1272,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.5.9"
+    APP_VERSION = "1.6.0"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
