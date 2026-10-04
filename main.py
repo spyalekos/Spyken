@@ -1273,7 +1273,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.0"
+    APP_VERSION = "1.6.1"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -1310,7 +1310,7 @@ def main(page: ft.Page):
             for f in files_list:
                 if f.path not in file_queue:
                     file_queue.append(f.path)
-                    selected_files_list.controls.append(ft.Text(f"Επιλέχθηκε: {f.name}", color=ft.Colors.WHITE70))
+                    selected_files_list.controls.append(ft.Text(f"Επιλέχθηκε: {f.name}", color=ft.Colors.WHITE_70))
             page.update()
 
     def clear_files(e):
@@ -1466,7 +1466,7 @@ def main(page: ft.Page):
                 content=ft.Column(
                     [
                         ft.Text(f"Έκδοση: v{APP_VERSION}", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
-                        ft.Divider(height=10, color=ft.Colors.WHITE24),
+                        ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         
                         # 🌟 Δυνατότητες
                         ft.Text("🌟 Κύριες Δυνατότητες:", size=15, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_200),
@@ -1475,7 +1475,7 @@ def main(page: ft.Page):
                         ft.Text("• Marquee Video: Οριζόντιο banner (1920×108) με οριζόντια κυλιόμενο κείμενο και πράσινο φωσφορίζον highlight στην ενεργή λέξη. Ιδανικό για tickers και επικαλύψεις βίντεο.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Έξυπνη Ανίχνευση Γλώσσας: Αυτόματη εναλλαγή μεταξύ Ελληνικών και Αγγλικών φωνών ανάλογα με το κείμενο.", size=13, color=ft.Colors.GREY_300),
                         
-                        ft.Divider(height=10, color=ft.Colors.WHITE24),
+                        ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         
                         # 📖 Οδηγίες Χρήσης
                         ft.Text("📖 Οδηγίες Χρήσης:", size=15, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_200),
@@ -1484,7 +1484,7 @@ def main(page: ft.Page):
                         ft.Text("3. Αποθήκευση: Τα παραγόμενα αρχεία αποθηκεύονται αυτόματα στον ίδιο φάκελο με τα αρχικά σας έγγραφα με κατάλληλη ονοματολογία (_marquee.mp4, .mp4, .mp3).", size=13, color=ft.Colors.GREY_300),
                         ft.Text("4. Καθαρισμός: Πατήστε 'Καθαρισμός' αν θέλετε να αδειάσετε τη λίστα των επιλεγμένων αρχείων σας.", size=13, color=ft.Colors.GREY_300),
                         
-                        ft.Divider(height=10, color=ft.Colors.WHITE24),
+                        ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         
                         # 🎶 Φωνές
                         ft.Text("🎶 Φωνές που χρησιμοποιούνται:", size=14, color=ft.Colors.AMBER_200),
@@ -1493,7 +1493,7 @@ def main(page: ft.Page):
                         ft.Text("  • Αγγλική Ανδρική: en-GB-RyanNeural", size=13, color=ft.Colors.GREY_400),
                         ft.Text("  • Αγγλική Γυναικεία: en-GB-SoniaNeural", size=13, color=ft.Colors.GREY_400),
                         
-                        ft.Divider(height=10, color=ft.Colors.WHITE24),
+                        ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         ft.Text("by spyalekos • github.com/spyalekos", size=13, color=ft.Colors.GREY_500),
                     ],
                     spacing=6,
@@ -1577,7 +1577,7 @@ def main(page: ft.Page):
                 button_row_top,
                 ft.Container(
                     content=selected_files_list,
-                    border=ft.Border.all(1, ft.Colors.WHITE24),
+                    border=ft.Border.all(1, ft.Colors.WHITE_24),
                     border_radius=10,
                     padding=10,
                     expand=True
