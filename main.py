@@ -1,4 +1,5 @@
 import flet as ft
+import flet_desktop
 import fitz  # PyMuPDF
 import docx
 import edge_tts
