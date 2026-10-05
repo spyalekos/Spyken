@@ -19,6 +19,16 @@ VOICE_FEMALE = "el-GR-AthinaNeural"
 VOICE_EN_MALE = "en-GB-RyanNeural"
 VOICE_EN_FEMALE = "en-GB-SoniaNeural"
 
+# Voice speed rates (Female voices speak slightly faster by default, so we slow them down by 7% for balanced pacing)
+RATE_MALE = "+0%"
+RATE_FEMALE = "-7%"
+
+def get_voice_rate(voice: str) -> str:
+    """Returns the speech rate for the given voice."""
+    if voice in (VOICE_FEMALE, VOICE_EN_FEMALE):
+        return RATE_FEMALE
+    return RATE_MALE
+
 # Video frame resolution
 VIDEO_W = 1280
 VIDEO_H = 720
@@ -58,22 +68,48 @@ _EMOJI_RE = _re.compile(
     "\U00002300-\U000027BF"  # misc technical/dingbats
     "\U0000FE00-\U0000FE0F"  # variation selectors
     "\U0001FA00-\U0001FAFF"  # extended symbols
+    "\U0000E000-\U0000F8FF"  # private use area
     "]+", flags=_re.UNICODE
 )
+
+def clean_document_text(text: str) -> str:
+    """
+    Cleans document text (especially DOCX) for visual rendering and speech:
+    - Normalizes 'ό'τι' / 'Ό'τι' (and variants with curly/grave apostrophes) to 'ότι' / 'Ότι'
+      so it is treated and pronounced as a single unified word instead of two words.
+    - Strips all unreadable characters, emojis, symbol dingbats, and private use glyphs
+      so that they do not appear as broken boxes in rendered video frames.
+    - Strips soft hyphens, zero-width spaces, replacement characters, and control characters.
+    - Normalizes multiple whitespace into a single space.
+    """
+    if not text:
+        return ""
+    # Normalize 'ό'τι' / 'Ό'τι' to 'ότι' / 'Ότι'
+    text = _re.sub(r"(?:\b|^)[όΌ]['’`´]τι(?:\b|$)", lambda m: "Ότι" if m.group(0)[0].isupper() else "ότι", text)
+
+    # Strip soft hyphens, zero-width spaces, joiners, BOM, and replacement char
+    for ch in ('\xad', '\u200b', '\u200c', '\u200d', '\ufeff', '\ufffd'):
+        text = text.replace(ch, '')
+    text = text.replace('\xa0', ' ')
+
+    # Strip emojis, symbols, and private-use area characters
+    text = _EMOJI_RE.sub(' ', text)
+
+    # Strip non-printable control characters
+    text = ''.join(c if (ord(c) >= 32 or c in '\n\t') else ' ' for c in text)
+
+    # Normalize excessive spaces
+    text = _re.sub(r'\s+', ' ', text).strip()
+    return text
+
 
 def clean_for_tts(text: str) -> str:
     """
     Preprocess and clean text for natural speech synthesis without changing
     the sequence or token identities of words, ensuring 100% word-timing alignment
     with document text and word highlighting.
-    - Strips emojis and decorative symbols.
-    - Strips soft hyphens (\xad) from PDF line breaks.
-    - Normalizes non-breaking spaces (\xa0) and zero-width spaces.
-    - Normalizes excessive repeated punctuation (e.g. '....' -> '... ').
     """
-    cleaned = text.replace('\xad', '').replace('\u200b', '').replace('\ufeff', '')
-    cleaned = cleaned.replace('\xa0', ' ')
-    cleaned = _EMOJI_RE.sub(' ', cleaned)
+    cleaned = clean_document_text(text)
     cleaned = _re.sub(r'\.{4,}', '... ', cleaned)
     cleaned = _re.sub(r'[-—–]{3,}', '— ', cleaned)
     cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
@@ -106,7 +142,7 @@ def extract_paragraphs(filepath: str) -> list[str]:
     if ext == 'docx':
         doc = docx.Document(filepath)
         for p in doc.paragraphs:
-            text = p.text.strip()
+            text = clean_document_text(p.text.strip())
             if is_valid_text(text):
                 paragraphs.append(text)
     elif ext == 'pdf':
@@ -182,7 +218,7 @@ def merge_pdf_blocks(blocks: list) -> list:
 
 # ─────────────────────────── TTS WITH WORD TIMING ─────────────────────────────
 
-async def generate_tts_with_word_timings(text: str, voice: str, out_path: str) -> list[dict]:
+async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, rate: str = None) -> list[dict]:
     """
     Stream TTS audio and collect WordBoundary events.
     Uses clean_for_tts(text) to strip emoji before sending to edge_tts,
@@ -191,12 +227,14 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str) -
     tts_text = clean_for_tts(text)
     if not tts_text:
         return []
+    if rate is None:
+        rate = get_voice_rate(voice)
     word_timings = []
     audio_bytes = bytearray()
 
     for attempt in range(3):
         try:
-            communicate = edge_tts.Communicate(tts_text, voice, boundary="WordBoundary")
+            communicate = edge_tts.Communicate(tts_text, voice, rate=rate, boundary="WordBoundary")
             word_timings.clear()
             audio_bytes.clear()
 
@@ -225,14 +263,16 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str) -
     return []
 
 
-async def generate_tts_chunk(text: str, voice: str, out_path: str) -> bool:
+async def generate_tts_chunk(text: str, voice: str, out_path: str, rate: str = None) -> bool:
     """Generate a single TTS mp3 chunk (audio only). Returns True on success."""
     tts_text = clean_for_tts(text)
     if not tts_text:
         return False
+    if rate is None:
+        rate = get_voice_rate(voice)
     for attempt in range(3):
         try:
-            communicate = edge_tts.Communicate(tts_text, voice)
+            communicate = edge_tts.Communicate(tts_text, voice, rate=rate)
             await communicate.save(out_path)
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return True
@@ -508,6 +548,7 @@ def _build_docx_layout(text: str, box_w: int, box_h: int):
     Returns (best_lines, best_font, line_h, font_size).
     """
     from PIL import ImageFont
+    text = clean_document_text(text)
 
     def try_wrap(font_sz):
         try:
@@ -868,7 +909,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             doc_obj = docx.Document(filepath)
             para_data = []
             for p in doc_obj.paragraphs:
-                text = p.text.strip()
+                text = clean_document_text(p.text.strip())
                 if is_valid_text(text):
                     para_data.append((text, len(para_data), None))
 
@@ -1498,7 +1539,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.2"
+    APP_VERSION = "1.6.3"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
