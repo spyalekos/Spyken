@@ -1,6 +1,6 @@
 import flet as ft
 import flet_desktop
-import fitz  # PyMuPDF
+import pymupdf as fitz
 import docx
 import edge_tts
 import asyncio
@@ -24,6 +24,7 @@ VIDEO_W = 1280
 VIDEO_H = 720
 VIDEO_FPS = 10  # Reduced from 24 to speed up rendering significantly
 VIDEO_TAIL_BUFFER_SEC = 1.5  # Freeze-frame buffer at the end of video for clear readability
+PARAGRAPH_PAUSE_SEC = 0.4  # Natural breathing pause between paragraphs/speakers for smooth speech flow
 
 # Marquee video frame resolution (horizontal banner, 1/10 of screen height)
 MARQUEE_W = 1920
@@ -62,12 +63,19 @@ _EMOJI_RE = _re.compile(
 
 def clean_for_tts(text: str) -> str:
     """
-    Remove emoji and symbol characters that cause edge_tts to produce
-    garbled word-boundary events (character spans instead of words).
-    The cleaned text is used ONLY for TTS; original text is kept for
-    PDF word-rect matching.
+    Preprocess and clean text for natural speech synthesis without changing
+    the sequence or token identities of words, ensuring 100% word-timing alignment
+    with document text and word highlighting.
+    - Strips emojis and decorative symbols.
+    - Strips soft hyphens (\xad) from PDF line breaks.
+    - Normalizes non-breaking spaces (\xa0) and zero-width spaces.
+    - Normalizes excessive repeated punctuation (e.g. '....' -> '... ').
     """
-    cleaned = _EMOJI_RE.sub(' ', text)
+    cleaned = text.replace('\xad', '').replace('\u200b', '').replace('\ufeff', '')
+    cleaned = cleaned.replace('\xa0', ' ')
+    cleaned = _EMOJI_RE.sub(' ', cleaned)
+    cleaned = _re.sub(r'\.{4,}', '... ', cleaned)
+    cleaned = _re.sub(r'[-—–]{3,}', '— ', cleaned)
     cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
@@ -231,6 +239,169 @@ async def generate_tts_chunk(text: str, voice: str, out_path: str) -> bool:
         except Exception:
             await asyncio.sleep(0.5)
     return False
+
+
+# ─────────────────────────── AUDIO POST-PROCESSING ────────────────────────────
+
+def get_ffmpeg_exe() -> str:
+    """Locates the bundled or system ffmpeg binary executable."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+def post_process_audio_file(
+    input_path: str,
+    output_path: str = None,
+    micro_fade: bool = True,
+    warm_eq: bool = True,
+    normalize_loudness: bool = True,
+) -> bool:
+    """
+    Applies audio post-processing to synthetic speech audio:
+    - Micro-fades (15ms in/out) to eliminate digital clicks/pops at boundaries.
+    - High-pass filter (80 Hz) to eliminate low-frequency rumble and DC offset.
+    - Vocal presence equalizer (3 kHz, +1.2 dB) for clarity and warmth.
+    - Sibilance de-harshing (7.5 kHz, -2.0 dB) to soften harsh synthetic 's' sounds.
+    - EBU R128 loudness normalization (-16 LUFS, True Peak -1.5 dB) for consistent volume.
+    """
+    import subprocess
+    import shutil
+
+    if output_path is None:
+        output_path = input_path
+
+    ffmpeg_exe = get_ffmpeg_exe()
+    filters = []
+
+    if micro_fade:
+        filters.extend([
+            "afade=t=in:ss=0:d=0.015",
+            "areverse",
+            "afade=t=in:ss=0:d=0.015",
+            "areverse",
+        ])
+    if warm_eq:
+        filters.extend([
+            "highpass=f=80",
+            "equalizer=f=3000:t=q:w=1.2:g=1.2",
+            "equalizer=f=7500:t=q:w=1.5:g=-2.0",
+        ])
+    if normalize_loudness:
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+
+    filter_str = ",".join(filters)
+
+    is_same = os.path.abspath(input_path) == os.path.abspath(output_path)
+    target_out = (output_path + ".tmp_proc.mp3") if is_same else output_path
+
+    try:
+        cmd = [ffmpeg_exe, "-y", "-i", input_path]
+        if filter_str:
+            cmd.extend(["-af", filter_str])
+        cmd.extend(["-b:a", "192k", target_out])
+
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        if res.returncode == 0 and os.path.exists(target_out) and os.path.getsize(target_out) > 0:
+            if is_same:
+                shutil.move(target_out, output_path)
+            return True
+    except Exception:
+        pass
+    finally:
+        if is_same and os.path.exists(target_out):
+            try:
+                os.remove(target_out)
+            except Exception:
+                pass
+
+    if not is_same and input_path != output_path and os.path.exists(input_path):
+        try:
+            shutil.copy2(input_path, output_path)
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def create_silence_mp3(duration_sec: float, output_path: str) -> bool:
+    """Generates an MP3 audio file containing clean silence of the specified duration."""
+    import subprocess
+    ffmpeg_exe = get_ffmpeg_exe()
+    try:
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", str(duration_sec),
+            "-b:a", "192k",
+            output_path,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        return res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception:
+        return False
+
+
+def concatenate_audio_files(input_files: list[str], output_path: str) -> bool:
+    """Concatenates multiple MP3 audio files seamlessly using ffmpeg concat demuxer."""
+    import subprocess
+    if not input_files:
+        return False
+
+    ffmpeg_exe = get_ffmpeg_exe()
+    list_file = output_path + ".concat_list.txt"
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for fpath in input_files:
+                clean_p = os.path.abspath(fpath).replace("\\", "/")
+                f.write(f"file '{clean_p}'\n")
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            output_path,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        return res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception:
+        return False
+    finally:
+        if os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except Exception:
+                pass
 
 
 # ─────────────────────────── VIDEO HELPERS ────────────────────────────────────
@@ -624,13 +795,22 @@ def align_word_timings_to_text(word_timings: list[dict], text: str) -> list[dict
     text_words = text.split()
     timing_words = [t.copy() for t in word_timings]
 
+    def _normalize(w: str) -> str:
+        return (
+            w.replace("\xad", "")
+            .replace("\u200b", "")
+            .replace("\ufeff", "")
+            .strip(".,;:!?\"'()[]»«—–-")
+            .lower()
+        )
+
     t_idx = 0
     for tw in timing_words:
         # Advance text_words pointer to find the best match
-        norm_tw = tw["word"].strip(".,;:!?\"'()[]»«—–-").lower()
+        norm_tw = _normalize(tw["word"])
         matched = False
         for offset in range(min(12, len(text_words) - t_idx)):
-            candidate = text_words[t_idx + offset].strip(".,;:!?\"'()[]»«—–-").lower()
+            candidate = _normalize(text_words[t_idx + offset])
             if candidate == norm_tw or (
                 norm_tw and candidate and (norm_tw in candidate or candidate in norm_tw)
             ):
@@ -723,6 +903,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 word_timings = await generate_tts_with_word_timings(chunk, voice, chunk_audio_path)
 
                 if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 0:
+                    post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                     ac = AudioFileClip(chunk_audio_path)
                     chunk_audio_clips.append(ac)
 
@@ -737,6 +918,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                     # Fallback: plain TTS without timings
                     ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
                     if ok:
+                        post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                         ac = AudioFileClip(chunk_audio_path)
                         chunk_audio_clips.append(ac)
                         chunk_time_offset += ac.duration
@@ -862,7 +1044,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                         return make_frame
 
                     pdf_f = create_pdf_frame_func(word_rect_timings, base_pdf_img, scale, x_off, y_off)
-                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
                     para_clips.append(VideoClip(pdf_f, duration=para_clip_duration))
 
                 else:
@@ -909,7 +1091,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                         return make_frame_docx
 
                     docx_f = create_docx_frame_func(word_render_timings, text, para_idx, total)
-                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                    para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
                     para_clips.append(VideoClip(docx_f, duration=para_clip_duration))
 
                 # No gap-fill needed: offset-based durations already cover total_duration
@@ -924,7 +1106,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                     frame_img = render_docx_paragraph_image(text, para_idx, total)
 
                 frame_np = np.array(frame_img.convert("RGB"))
-                para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else total_duration
+                para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
                 para_clips.append(ImageClip(frame_np, duration=para_clip_duration if para_clip_duration else 3.0))
 
             # ── 5. Concatenate word clips → paragraph clip ─────────────────────
@@ -936,10 +1118,16 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 para_video = concatenate_videoclips(para_clips, method="chain")
 
             if combined_audio:
-                if i == total - 1 and VIDEO_TAIL_BUFFER_SEC > 0:
-                    from moviepy import AudioArrayClip
-                    silence = AudioArrayClip(np.zeros((int(44100 * VIDEO_TAIL_BUFFER_SEC), 2)), fps=44100)
-                    combined_audio = concatenate_audioclips([combined_audio, silence])
+                if i == total - 1:
+                    if VIDEO_TAIL_BUFFER_SEC > 0:
+                        from moviepy import AudioArrayClip
+                        silence = AudioArrayClip(np.zeros((int(44100 * VIDEO_TAIL_BUFFER_SEC), 2)), fps=44100)
+                        combined_audio = concatenate_audioclips([combined_audio, silence])
+                else:
+                    if PARAGRAPH_PAUSE_SEC > 0:
+                        from moviepy import AudioArrayClip
+                        silence = AudioArrayClip(np.zeros((int(44100 * PARAGRAPH_PAUSE_SEC), 2)), fps=44100)
+                        combined_audio = concatenate_audioclips([combined_audio, silence])
                 audio_dur = combined_audio.duration
                 video_dur = para_video.duration
                 if audio_dur > video_dur:
@@ -1055,6 +1243,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                 )
 
                 if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 0:
+                    post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                     ac = AudioFileClip(chunk_audio_path)
                     chunk_audio_clips.append(ac)
                     for wt in word_timings:
@@ -1065,6 +1254,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                 else:
                     ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
                     if ok:
+                        post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                         ac = AudioFileClip(chunk_audio_path)
                         chunk_audio_clips.append(ac)
                         chunk_time_offset += ac.duration
@@ -1102,7 +1292,15 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                         "global_word_idx": g_idx,
                     })
 
-            accumulated_time += para_duration
+            # Add inter-paragraph pause if not the last paragraph
+            if i < total_paras - 1 and PARAGRAPH_PAUSE_SEC > 0:
+                from moviepy import AudioArrayClip
+                silence = AudioArrayClip(np.zeros((int(44100 * PARAGRAPH_PAUSE_SEC), 2)), fps=44100)
+                all_audio_clips.append(silence)
+                accumulated_time += para_duration + PARAGRAPH_PAUSE_SEC
+            else:
+                accumulated_time += para_duration
+
             global_word_offset += len(para_text.split())
 
         total_duration = accumulated_time
@@ -1219,61 +1417,88 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
 # ──────────────────────────── AUDIO CONVERSION ────────────────────────────────
 
 async def convert_to_audio(paragraphs: list[str], output_path: str, progress_callback):
+    """
+    Generates seamless, natural MP3 speech audio from paragraphs:
+    - Alternates male and female voices per paragraph.
+    - Applies vocal presence EQ, high-pass filtering, and micro-fades to eliminate clicks.
+    - Inserts a natural breathing pause (PARAGRAPH_PAUSE_SEC) between paragraphs.
+    - Stitches audio files seamlessly via ffmpeg concat demuxer (with binary fallback).
+    - Applies EBU R128 loudness normalization for consistent volume.
+    """
     temp_dir = tempfile.mkdtemp()
     temp_files = []
 
-    all_chunks = []
-    for p in paragraphs:
-        all_chunks.extend(chunk_text(p))
-
-    total = len(all_chunks)
+    total_paras = len(paragraphs)
     voice_index = 0
 
-    for i, chunk in enumerate(all_chunks):
-        voice = (
-            (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
-            if is_english(chunk)
-            else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
-        )
-        temp_file = os.path.join(temp_dir, f"part_{i}.mp3")
+    try:
+        for p_idx, para in enumerate(paragraphs):
+            voice = (
+                (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
+                if is_english(para)
+                else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
+            )
 
-        success = False
-        for attempt in range(3):
+            chunks = chunk_text(para, 800)
+            para_success = False
+
+            for c_idx, chunk in enumerate(chunks):
+                temp_file = os.path.join(temp_dir, f"p{p_idx}_c{c_idx}.mp3")
+                ok = await generate_tts_chunk(chunk, voice, temp_file)
+                if ok and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                    post_process_audio_file(temp_file, warm_eq=True, micro_fade=True, normalize_loudness=False)
+                    temp_files.append(temp_file)
+                    para_success = True
+
+            if para_success:
+                voice_index += 1
+                # Insert natural breathing pause between paragraphs (except after the last paragraph)
+                if p_idx < total_paras - 1 and PARAGRAPH_PAUSE_SEC > 0:
+                    silence_file = os.path.join(temp_dir, f"silence_{p_idx}.mp3")
+                    if create_silence_mp3(PARAGRAPH_PAUSE_SEC, silence_file):
+                        temp_files.append(silence_file)
+
             try:
-                communicate = edge_tts.Communicate(chunk, voice)
-                await communicate.save(temp_file)
-                if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                    success = True
-                    break
-            except Exception:
-                await asyncio.sleep(0.5)
+                progress_callback(p_idx + 1, total_paras, f"Δημιουργία ήχου: {p_idx + 1}/{total_paras} παράγραφοι")
+            except TypeError:
+                progress_callback(p_idx + 1, total_paras)
 
-        if success:
-            temp_files.append(temp_file)
-            voice_index += 1
+        if not temp_files:
+            raise ValueError("Δεν παρήχθησαν αρχεία ήχου.")
 
-        progress_callback(i + 1, total)
-
-    with open(output_path, "wb") as outfile:
-        for tf in temp_files:
-            with open(tf, "rb") as infile:
-                outfile.write(infile.read())
-
-    for tf in temp_files:
+        # Stitch all parts and pauses together cleanly using ffmpeg concat
         try:
-            os.remove(tf)
+            progress_callback(total_paras, total_paras, "Ολοκλήρωση & ομαλοποίηση ήχου...")
+        except TypeError:
+            progress_callback(total_paras, total_paras)
+
+        concat_ok = concatenate_audio_files(temp_files, output_path)
+        if not concat_ok or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            # Fallback to direct concatenation if ffmpeg fails
+            with open(output_path, "wb") as outfile:
+                for tf in temp_files:
+                    with open(tf, "rb") as infile:
+                        outfile.write(infile.read())
+
+        # Final broadcast loudness normalization (EBU R128)
+        post_process_audio_file(output_path, warm_eq=False, micro_fade=False, normalize_loudness=True)
+
+    finally:
+        for tf in temp_files:
+            try:
+                os.remove(tf)
+            except Exception:
+                pass
+        try:
+            os.rmdir(temp_dir)
         except Exception:
             pass
-    try:
-        os.rmdir(temp_dir)
-    except Exception:
-        pass
 
 
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.1"
+    APP_VERSION = "1.6.2"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -1347,9 +1572,9 @@ def main(page: ft.Page):
 
                 output_path = os.path.splitext(filepath)[0] + ".mp3"
 
-                def update_progress(current, total):
-                    progress_bar.value = current / total
-                    status_text.value = f"Δημιουργία ήχου: {current}/{total} παράγραφοι"
+                def update_progress(current, total, msg=""):
+                    progress_bar.value = (current / total) if total > 0 else 0
+                    status_text.value = msg if msg else f"Δημιουργία ήχου: {current}/{total} παράγραφοι"
                     page.update()
 
                 await convert_to_audio(paragraphs, output_path, update_progress)
@@ -1471,6 +1696,7 @@ def main(page: ft.Page):
                         # 🌟 Δυνατότητες
                         ft.Text("🌟 Κύριες Δυνατότητες:", size=15, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_200),
                         ft.Text("• Μετατροπή σε MP3: Παραγωγή αρχείων ήχου με αυτόματη εναλλαγή ανδρικής & γυναικείας φωνής ανά παράγραφο.", size=13, color=ft.Colors.GREY_300),
+                        ft.Text("• Ομαλή & Φυσική Ομιλία: Μετά-επεξεργασία ήχου (studio EQ, de-harshing, micro-fades, EBU R128 loudness normalization) και φυσικές ανάσες/παύσεις ανάμεσα στις παραγράφους.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Μετατροπή σε MP4: Βίντεο παρουσίασης (1280×720) με οπτική προβολή των σελίδων PDF ή παραγράφων DOCX και απόλυτα συγχρονισμένο φωτισμό κάθε λέξης.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Marquee Video: Οριζόντιο banner (1920×108) με οριζόντια κυλιόμενο κείμενο και πράσινο φωσφορίζον highlight στην ενεργή λέξη. Ιδανικό για tickers και επικαλύψεις βίντεο.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Έξυπνη Ανίχνευση Γλώσσας: Αυτόματη εναλλαγή μεταξύ Ελληνικών και Αγγλικών φωνών ανάλογα με το κείμενο.", size=13, color=ft.Colors.GREY_300),
@@ -1649,6 +1875,7 @@ async def run_cli_async(text: str):
         print("Δημιουργία αρχείου ήχου...")
         ok = await generate_tts_chunk(text, voice, temp_path)
         if ok and os.path.exists(temp_path):
+            post_process_audio_file(temp_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
             print("Αναπαραγωγή...")
             play_audio_windows(temp_path)
             print("Ολοκληρώθηκε.")
