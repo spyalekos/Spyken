@@ -12,6 +12,13 @@ import textwrap
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.path.abspath(".")
+    p = os.path.join(base_dir, relative_path)
+    if os.path.exists(p):
+        return p
     return os.path.join(os.path.abspath("."), relative_path)
 
 VOICE_MALE = "el-GR-NestorasNeural"
@@ -253,9 +260,17 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, r
                     })
 
             if audio_bytes:
-                with open(out_path, "wb") as f:
-                    f.write(audio_bytes)
-                return word_timings
+                # If edge-tts gave us audio and word timings, return them!
+                # If word timings was empty on this attempt, retry up to 3 attempts.
+                if word_timings:
+                    with open(out_path, "wb") as f:
+                        f.write(audio_bytes)
+                    return word_timings
+                elif attempt == 2:
+                    # Final attempt: write audio even if timings are missing
+                    with open(out_path, "wb") as f:
+                        f.write(audio_bytes)
+                    return []
 
         except Exception:
             await asyncio.sleep(0.5)
@@ -604,20 +619,44 @@ def _build_docx_layout(text: str, box_w: int, box_h: int):
     return best_lines, best_font, line_h, best_font_size
 
 
+_AVATAR_CACHE = {}
+
+def get_avatar_image(name: str, target_h: int = 570):
+    cache_key = (name, target_h)
+    if cache_key not in _AVATAR_CACHE:
+        from PIL import Image
+        path = get_asset_path(os.path.join("assets", f"{name}.png"))
+        if not os.path.exists(path):
+            path = os.path.join("assets", f"{name}.png")
+        if os.path.exists(path):
+            try:
+                raw_img = Image.open(path).convert("RGBA")
+                av_w = int(raw_img.width * (target_h / raw_img.height))
+                _AVATAR_CACHE[cache_key] = raw_img.resize((av_w, target_h), Image.Resampling.LANCZOS)
+            except Exception:
+                _AVATAR_CACHE[cache_key] = None
+        else:
+            _AVATAR_CACHE[cache_key] = None
+    return _AVATAR_CACHE.get(cache_key)
+
+
 def render_docx_paragraph_image(
     text: str,
     para_idx: int,
     total: int,
     highlight_word: str = None,
     highlight_word_idx: int = -1,
+    mouth_state: int = -1,
+    is_female: bool = False,
     target_w: int = VIDEO_W,
     target_h: int = VIDEO_H,
 ):
     """
-    Render a DOCX paragraph as a PIL Image.
-    - If highlight_word is given, that specific word is highlighted in bright fluorescent green;
-      the rest of the text box has a dimmer backdrop.
-    - Otherwise falls back to the full-paragraph highlight.
+    Render a DOCX paragraph as a PIL Image with a cartoon teacher avatar.
+    - Avatar teacher stands on the left beside a presentation chalkboard.
+    - Automatically switches between male and female teacher avatar matching speaker gender.
+    - When words are spoken, the avatar animates its mouth (mouth_state).
+    - If highlight_word is given, that specific word is highlighted in bright fluorescent green.
     Returns a PIL Image (RGB).
     """
     from PIL import Image, ImageDraw, ImageFont
@@ -625,7 +664,7 @@ def render_docx_paragraph_image(
     BG = (24, 28, 42)
     HEADER_BG = (40, 44, 64)
     H_COLOR = HIGHLIGHT_COLOR          # (57, 255, 20)
-    TEXT_COLOR = (30, 30, 30)
+    TEXT_COLOR = (20, 20, 20)
     HEADER_COLOR = (180, 180, 200)
 
     canvas = Image.new("RGB", (target_w, target_h), BG)
@@ -640,11 +679,76 @@ def render_docx_paragraph_image(
     except Exception:
         draw.text((target_w // 2, 30), header_txt, fill=HEADER_COLOR, anchor="mm")
 
-    # Layout dimensions
-    box_w = target_w - 120
-    box_h = target_h - 160
-    box_x = 60
-    box_y = 90
+    # Footer bar
+    draw.rectangle([0, target_h - 40, target_w, target_h], fill=HEADER_BG)
+    footer_txt = "Spyken · MP4 by spyalekos"
+    try:
+        footer_font = ImageFont.truetype("arial.ttf", size=18)
+        draw.text((target_w // 2, target_h - 20), footer_txt,
+                  font=footer_font, fill=(100, 100, 130), anchor="mm")
+    except Exception:
+        draw.text((target_w // 2, target_h - 20), footer_txt, fill=(100, 100, 130), anchor="mm")
+
+    # Check for teacher avatar (male or female depending on is_female)
+    av_h = 570
+    prefix = "female_teacher" if is_female else "teacher"
+    teacher_idle = get_avatar_image(f"{prefix}_idle", target_h=av_h)
+    if teacher_idle is None and is_female:
+        # Fallback to male teacher if female assets are missing
+        teacher_idle = get_avatar_image("teacher_idle", target_h=av_h)
+        prefix = "teacher"
+
+    if teacher_idle is not None:
+        # Choose avatar frame based on mouth_state (speaking vs resting)
+        if mouth_state == 0:
+            avatar = get_avatar_image(f"{prefix}_talk", target_h=av_h) or teacher_idle
+        elif mouth_state == 1:
+            avatar = get_avatar_image(f"{prefix}_talk2", target_h=av_h) or teacher_idle
+        elif mouth_state == 2:
+            avatar = teacher_idle
+        else:
+            avatar = teacher_idle
+
+        # Presentation chalkboard on the right
+        board_x = 410
+        board_y = 80
+        board_w = target_w - board_x - 30
+        board_h = target_h - board_y - 65
+
+        # Outer border / frame of board
+        draw.rounded_rectangle(
+            [board_x, board_y, board_x + board_w, board_y + board_h],
+            radius=16, fill=(18, 22, 34), outline=(60, 70, 95), width=3
+        )
+        # Speech balloon pointer pointing left towards avatar mouth
+        draw.polygon([(board_x, 320), (board_x - 35, 340), (board_x, 360)], fill=(18, 22, 34), outline=(60, 70, 95))
+        draw.line([(board_x, 321), (board_x, 359)], fill=(18, 22, 34), width=3)
+
+        # Inner board slate
+        draw.rounded_rectangle(
+            [board_x + 8, board_y + 8, board_x + board_w - 8, board_y + board_h - 8],
+            radius=12, fill=(26, 32, 48)
+        )
+        draw.polygon([(board_x + 8, 325), (board_x - 25, 340), (board_x + 8, 355)], fill=(26, 32, 48))
+
+        # Paste teacher avatar on the left side
+        av_x = -70
+        av_y = target_h - 40 - av_h
+        canvas.paste(avatar, (av_x, av_y), avatar)
+
+        # Text area layout inside board (generous margin ensuring no overlap with avatar hand)
+        box_w = board_w - 110
+        box_h = board_h - 80
+        box_x = board_x + 75
+        box_y = board_y + 40
+        normal_txt_color = (215, 230, 245)
+    else:
+        # Fallback layout (box layout without avatar if assets unavailable)
+        box_w = target_w - 120
+        box_h = target_h - 160
+        box_x = 60
+        box_y = 90
+        normal_txt_color = (200, 220, 200) if highlight_word else TEXT_COLOR
 
     best_lines, best_font, line_h, font_size = _build_docx_layout(text, box_w, box_h)
 
@@ -659,22 +763,19 @@ def render_docx_paragraph_image(
     tx = box_x - 20
     ty = box_y - 10
 
-    if highlight_word:
-        # Draw a dim backdrop for the whole paragraph box
-        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
-                       fill=(30, 80, 30))
-        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
-                       outline=(0, 120, 0), width=2)
-    else:
-        # Full bright highlight (original behaviour)
-        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], fill=H_COLOR)
-        draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], outline=(0, 200, 0), width=4)
+    if teacher_idle is None:
+        if highlight_word:
+            draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
+                           fill=(30, 80, 30))
+            draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h],
+                           outline=(0, 120, 0), width=2)
+        else:
+            draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], fill=H_COLOR)
+            draw.rectangle([tx, ty, tx + text_block_w, ty + text_block_h], outline=(0, 200, 0), width=4)
 
     # Draw text lines and find word bounding box
     y_cursor = box_y + 10
-    word_rect_found = None  # (x0, y0, x1, y1) on canvas
 
-    # Normalize highlight_word for comparison (strip punctuation)
     def normalize(w):
         return w.strip(".,;:!?\"'()[]»«—–-").lower() if w else ""
 
@@ -718,9 +819,7 @@ def render_docx_paragraph_image(
                 draw.text((x_cursor, y_cursor), lw, font=best_font, fill=TEXT_COLOR)
                 word_found = True
             else:
-                # Normal text (white-ish on dark backdrop when word mode)
-                txt_col = (200, 220, 200) if highlight_word else TEXT_COLOR
-                draw.text((x_cursor, y_cursor), lw, font=best_font, fill=txt_col)
+                draw.text((x_cursor, y_cursor), lw, font=best_font, fill=normal_txt_color)
 
             # Advance x by word width + space width
             if hasattr(best_font, 'getbbox'):
@@ -734,17 +833,8 @@ def render_docx_paragraph_image(
         if y_cursor > box_y + box_h:
             break
 
-    # Footer
-    draw.rectangle([0, target_h - 40, target_w, target_h], fill=HEADER_BG)
-    footer_txt = "Spyken · MP4 by spyalekos"
-    try:
-        footer_font = ImageFont.truetype("arial.ttf", size=18)
-        draw.text((target_w // 2, target_h - 20), footer_txt,
-                  font=footer_font, fill=(100, 100, 130), anchor="mm")
-    except Exception:
-        draw.text((target_w // 2, target_h - 20), footer_txt, fill=(100, 100, 130), anchor="mm")
-
     return canvas
+
 
 
 # ─────────────────────── MARQUEE VIDEO HELPERS ────────────────────────────────
@@ -976,8 +1066,25 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 total_duration = 3.0
 
             # ── 3. Align word timings to actual text ──────────────────────────
+            is_female_voice = voice in (VOICE_FEMALE, VOICE_EN_FEMALE)
             if all_word_timings:
                 all_word_timings = align_word_timings_to_text(all_word_timings, text)
+            elif ext == 'docx':
+                # Resilient fallback for DOCX: synthesize proportional word timings
+                # so word highlighting and talking mouth animation NEVER disappear!
+                words = text.split()
+                if words and total_duration > 0:
+                    per_word_dur = total_duration / len(words)
+                    all_word_timings = [
+                        {
+                            "offset_s": idx * per_word_dur,
+                            "duration_s": per_word_dur,
+                            "word": w,
+                            "text_word": w,
+                            "text_word_idx": idx,
+                        }
+                        for idx, w in enumerate(words)
+                    ]
 
             # ── 4. Build per-word frames ───────────────────────────────────────
             progress_callback(i, total, f"Παράγραφος {i+1}/{total}: Frames…")
@@ -1107,7 +1214,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                             "text_word_idx": wt.get("text_word_idx", -1)
                         })
 
-                    def create_docx_frame_func(wrt, p_text, p_idx, p_total):
+                    def create_docx_frame_func(wrt, p_text, p_idx, p_total, female):
                         import numpy as np
                         cache = {}
                         def make_frame_docx(t):
@@ -1119,19 +1226,27 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                                     active_word_idx = entry["text_word_idx"]
                                     break
                             
-                            cache_key = (active_word, active_word_idx)
+                            # Animate avatar mouth when speaking, rest when silent
+                            if active_word is not None:
+                                mouth_state = int(t * 7) % 3
+                            else:
+                                mouth_state = -1
+
+                            cache_key = (active_word, active_word_idx, mouth_state, female)
                             if cache_key not in cache:
                                 img = render_docx_paragraph_image(
                                     p_text, p_idx, p_total,
                                     highlight_word=active_word,
-                                    highlight_word_idx=active_word_idx
+                                    highlight_word_idx=active_word_idx,
+                                    mouth_state=mouth_state,
+                                    is_female=female
                                 )
                                 cache[cache_key] = np.array(img.convert("RGB"))
                             
                             return cache[cache_key]
                         return make_frame_docx
 
-                    docx_f = create_docx_frame_func(word_render_timings, text, para_idx, total)
+                    docx_f = create_docx_frame_func(word_render_timings, text, para_idx, total, is_female_voice)
                     para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
                     para_clips.append(VideoClip(docx_f, duration=para_clip_duration))
 
@@ -1144,7 +1259,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                     frame_img = render_page_pdf_image(pdf_doc, page_idx, highlight_rect=rect)
                 else:
                     _, para_idx, _ = para_item
-                    frame_img = render_docx_paragraph_image(text, para_idx, total)
+                    frame_img = render_docx_paragraph_image(text, para_idx, total, mouth_state=-1, is_female=is_female_voice)
 
                 frame_np = np.array(frame_img.convert("RGB"))
                 para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
@@ -1539,7 +1654,7 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.3"
+    APP_VERSION = "1.6.6"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -1556,10 +1671,107 @@ def main(page: ft.Page):
 
     file_queue = []
 
+    # ── Cartoon Teacher Avatar Card (DOCX only) ──────────────────────────────
+    avatar_image = ft.Image(
+        src=get_asset_path("assets/teacher_idle.png"),
+        width=85,
+        height=85,
+        fit=ft.BoxFit.CONTAIN,
+    )
+    avatar_bubble_title = ft.Text("👨‍🏫 Δάσκαλος Spyken", weight=ft.FontWeight.BOLD, size=14, color=ft.Colors.AMBER_300)
+    avatar_bubble_text = ft.Text("Επιλέξτε ένα αρχείο .docx για να ξεκινήσει η εκφώνηση!", size=13, color=ft.Colors.WHITE, italic=True)
+
+    avatar_bubble = ft.Container(
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.RECORD_VOICE_OVER, color=ft.Colors.AMBER_400, size=18),
+                        avatar_bubble_title,
+                    ],
+                    spacing=6,
+                ),
+                ft.Divider(height=2, color="transparent"),
+                avatar_bubble_text,
+            ],
+            spacing=2,
+            tight=True,
+        ),
+        bgcolor="#1C2232",
+        border=ft.Border.all(1, ft.Colors.BLUE_GREY_700),
+        border_radius=12,
+        padding=10,
+        expand=True,
+    )
+
+    avatar_card = ft.Container(
+        content=ft.Row(
+            [
+                ft.Container(
+                    content=avatar_image,
+                    border=ft.Border.all(2, ft.Colors.AMBER_400),
+                    border_radius=45,
+                    bgcolor="#181C2A",
+                    padding=3,
+                ),
+                avatar_bubble,
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=12,
+        ),
+        bgcolor="#141824",
+        border=ft.Border.all(1, ft.Colors.WHITE_24),
+        border_radius=14,
+        padding=8,
+        visible=False,
+    )
+
+    _is_speaking = False
+
+    async def avatar_speak(text: str, speed: float = 0.02, is_female: bool = False):
+        nonlocal _is_speaking
+        if not any(f.lower().endswith('.docx') for f in file_queue):
+            return
+        avatar_card.visible = True
+        
+        prefix = "female_teacher" if is_female else "teacher"
+
+        if _is_speaking:
+            avatar_bubble_text.value = text
+            page.update()
+            return
+
+        _is_speaking = True
+        try:
+            mouth_images = [
+                get_asset_path(f"assets/{prefix}_talk.png"),
+                get_asset_path(f"assets/{prefix}_talk2.png"),
+            ]
+            idle_img = get_asset_path(f"assets/{prefix}_idle.png")
+
+            step = 3
+            for i in range(0, len(text), step):
+                if not _is_speaking:
+                    break
+                avatar_bubble_text.value = text[:i + step]
+                avatar_image.src = mouth_images[(i // step) % len(mouth_images)]
+                page.update()
+                await asyncio.sleep(speed)
+
+            avatar_bubble_text.value = text
+            avatar_image.src = idle_img
+            page.update()
+        except Exception:
+            pass
+        finally:
+            _is_speaking = False
+
     def log(msg, error=False):
         color = ft.Colors.RED_400 if error else ft.Colors.GREEN_400
         selected_files_list.controls.append(ft.Text(msg, color=color))
         page.update()
+        if any(f.lower().endswith('.docx') for f in file_queue):
+            page.run_task(avatar_speak, msg)
 
     def set_all_buttons(disabled: bool):
         pick_btn.disabled = disabled
@@ -1573,16 +1785,27 @@ def main(page: ft.Page):
         file_picker = ft.FilePicker()
         files_list = await file_picker.pick_files(allow_multiple=True, allowed_extensions=["pdf", "docx"])
         if files_list:
+            docx_found = None
             for f in files_list:
                 if f.path not in file_queue:
                     file_queue.append(f.path)
                     selected_files_list.controls.append(ft.Text(f"Επιλέχθηκε: {f.name}", color=ft.Colors.WHITE_70))
+                    if f.name.lower().endswith('.docx'):
+                        docx_found = f.name
+            
+            has_docx = any(p.lower().endswith('.docx') for p in file_queue)
+            avatar_card.visible = has_docx
             page.update()
+
+            if docx_found:
+                await avatar_speak(f"Γεια σας! Φορτώθηκε το Word έγγραφο «{docx_found}». Είμαι έτοιμος να σας το διαβάσω!")
 
     def clear_files(e):
         file_queue.clear()
         selected_files_list.controls.clear()
         selected_files_list.controls.append(ft.Text("Η λίστα καθαρίστηκε", color=ft.Colors.GREY_400))
+        avatar_card.visible = False
+        avatar_image.src = get_asset_path("assets/teacher_idle.png")
         page.update()
 
     # ── MP3 Conversion ────────────────────────────────────────────────────────
@@ -1600,9 +1823,14 @@ def main(page: ft.Page):
         page.update()
 
         for filepath in file_queue:
+            ext = filepath.lower().split('.')[-1]
             status_text.value = f"Εξαγωγή κειμένου: {os.path.basename(filepath)}"
             status_text.color = ft.Colors.BLUE_400
             page.update()
+
+            if ext == 'docx':
+                avatar_card.visible = True
+                await avatar_speak(f"Ξεκινώ την ανάγνωση του «{os.path.basename(filepath)}»...")
 
             try:
                 await asyncio.sleep(0.1)
@@ -1617,6 +1845,9 @@ def main(page: ft.Page):
                     progress_bar.value = (current / total) if total > 0 else 0
                     status_text.value = msg if msg else f"Δημιουργία ήχου: {current}/{total} παράγραφοι"
                     page.update()
+                    if ext == 'docx' and current > 0:
+                        fem = ((current - 1) % 2 != 0)
+                        page.run_task(avatar_speak, f"Εκφωνώ παράγραφο {current}/{total}...", 0.02, fem)
 
                 await convert_to_audio(paragraphs, output_path, update_progress)
                 log(f"Ολοκληρώθηκε: {os.path.basename(output_path)}")
@@ -1628,6 +1859,8 @@ def main(page: ft.Page):
         status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         set_all_buttons(False)
+        if any(p.lower().endswith('.docx') for p in file_queue):
+            await avatar_speak("Όλες οι μετατροπές ολοκληρώθηκαν με επιτυχία!")
 
     # ── MP4 Conversion ────────────────────────────────────────────────────────
 
@@ -1653,6 +1886,10 @@ def main(page: ft.Page):
             status_text.color = ft.Colors.PURPLE_300
             page.update()
 
+            if ext == 'docx':
+                avatar_card.visible = True
+                await avatar_speak(f"Ετοιμάζω το βίντεο παρουσίασης για το «{os.path.basename(filepath)}»...")
+
             try:
                 output_path = os.path.splitext(filepath)[0] + ".mp4"
                 loop = asyncio.get_running_loop()
@@ -1663,6 +1900,9 @@ def main(page: ft.Page):
                         status_text.value = f"🎬 {msg}" if msg else f"🎬 Παράγραφος {current}/{total}"
                         status_text.color = ft.Colors.PURPLE_300
                         page.update()
+                        if ext == 'docx' and current > 0:
+                            fem = ((current - 1) % 2 != 0)
+                            page.run_task(avatar_speak, f"Παράγω βίντεο παραγράφου {current}/{total}...", 0.02, fem)
                     loop.call_soon_threadsafe(_update_ui)
 
                 await convert_to_video(filepath, output_path, update_video_progress)
@@ -1675,6 +1915,8 @@ def main(page: ft.Page):
         status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         set_all_buttons(False)
+        if any(p.lower().endswith('.docx') for p in file_queue):
+            await avatar_speak("Η δημιουργία του βίντεο ολοκληρώθηκε με επιτυχία!")
 
     # ── Marquee Video Conversion ──────────────────────────────────────────────
 
@@ -1691,6 +1933,18 @@ def main(page: ft.Page):
         page.update()
 
         for filepath in file_queue:
+            ext = filepath.lower().split('.')[-1]
+            if ext not in ('pdf', 'docx'):
+                log(f"Μη υποστηριζόμενο αρχείο για marquee: {os.path.basename(filepath)}", error=True)
+                continue
+
+            status_text.value = f"📺 Ξεκινά δημιουργία Marquee video: {os.path.basename(filepath)}"
+            status_text.color = ft.Colors.TEAL_300
+            page.update()
+
+            if ext == 'docx':
+                avatar_card.visible = True
+                await avatar_speak(f"Ετοιμάζω το Marquee banner για το «{os.path.basename(filepath)}»...")
             ext = filepath.lower().split('.')[-1]
             if ext not in ('pdf', 'docx'):
                 log(f"Μη υποστηριζόμενο αρχείο για marquee: {os.path.basename(filepath)}", error=True)
@@ -1738,7 +1992,7 @@ def main(page: ft.Page):
                         ft.Text("🌟 Κύριες Δυνατότητες:", size=15, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_200),
                         ft.Text("• Μετατροπή σε MP3: Παραγωγή αρχείων ήχου με αυτόματη εναλλαγή ανδρικής & γυναικείας φωνής ανά παράγραφο.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Ομαλή & Φυσική Ομιλία: Μετά-επεξεργασία ήχου (studio EQ, de-harshing, micro-fades, EBU R128 loudness normalization) και φυσικές ανάσες/παύσεις ανάμεσα στις παραγράφους.", size=13, color=ft.Colors.GREY_300),
-                        ft.Text("• Μετατροπή σε MP4: Βίντεο παρουσίασης (1280×720) με οπτική προβολή των σελίδων PDF ή παραγράφων DOCX και απόλυτα συγχρονισμένο φωτισμό κάθε λέξης.", size=13, color=ft.Colors.GREY_300),
+                        ft.Text("• Μετατροπή σε MP4: Βίντεο παρουσίασης (1280×720) με οπτική προβολή των σελίδων PDF ή παραγράφων DOCX. Στα έγγραφα DOCX ενσωματώνεται διαδραστικός καρτούν-δάσκαλος avatar με δυναμική κίνηση ομιλίας συγχρονισμένη με την εκφώνηση και πράσινο φωτισμό κάθε λέξης.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Marquee Video: Οριζόντιο banner (1920×108) με οριζόντια κυλιόμενο κείμενο και πράσινο φωσφορίζον highlight στην ενεργή λέξη. Ιδανικό για tickers και επικαλύψεις βίντεο.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Έξυπνη Ανίχνευση Γλώσσας: Αυτόματη εναλλαγή μεταξύ Ελληνικών και Αγγλικών φωνών ανάλογα με το κείμενο.", size=13, color=ft.Colors.GREY_300),
                         
@@ -1840,7 +2094,8 @@ def main(page: ft.Page):
         content=ft.Column(
             [
                 header,
-                ft.Divider(height=16, color="transparent"),
+                avatar_card,
+                ft.Divider(height=10, color="transparent"),
                 button_row_top,
                 ft.Container(
                     content=selected_files_list,
@@ -1954,4 +2209,4 @@ if __name__ == "__main__":
             asyncio.run(run_cli_async(text_arg))
             sys.exit(0)
             
-    ft.run(main)
+    ft.run(main, assets_dir=get_asset_path("assets"))
