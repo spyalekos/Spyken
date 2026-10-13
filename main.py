@@ -225,11 +225,42 @@ def merge_pdf_blocks(blocks: list) -> list:
 
 # ─────────────────────────── TTS WITH WORD TIMING ─────────────────────────────
 
+def sync_edge_tts_clock():
+    """
+    Sync DRM clock skew with Microsoft's speech server date to prevent 403 Forbidden.
+    Edge-TTS calculates the Sec-MS-GEC token using UTC time rounded to 5-minute buckets.
+    If the system clock drifts even slightly across a 5-minute boundary, Microsoft rejects
+    the WebSocket handshake with HTTP 403. This function fetches the server's HTTP Date
+    header and synchronizes edge_tts.drm.DRM.clock_skew_seconds proactively.
+    """
+    try:
+        import urllib.request
+        from edge_tts.drm import DRM
+        from datetime import datetime as dt, timezone as tz
+        req = urllib.request.Request(
+            "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        headers = getattr(e, "headers", None)
+        if headers:
+            server_date = headers.get("Date")
+            if server_date:
+                from edge_tts.drm import DRM
+                from datetime import datetime as dt, timezone as tz
+                parsed = DRM.parse_rfc2616_date(server_date)
+                if parsed:
+                    local_now = dt.now(tz.utc).timestamp()
+                    DRM.clock_skew_seconds = parsed - local_now
+
+
 async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, rate: str = None) -> list[dict]:
     """
     Stream TTS audio and collect WordBoundary events.
     Uses clean_for_tts(text) to strip emoji before sending to edge_tts,
     so word-boundary events contain proper words instead of character spans.
+    Features resilient exponential backoff and clock resynchronization against rate-limiting.
     """
     tts_text = clean_for_tts(text)
     if not tts_text:
@@ -239,7 +270,8 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, r
     word_timings = []
     audio_bytes = bytearray()
 
-    for attempt in range(3):
+    delays = [1.0, 2.0, 3.5, 5.0, 7.0]
+    for attempt, delay in enumerate(delays):
         try:
             communicate = edge_tts.Communicate(tts_text, voice, rate=rate, boundary="WordBoundary")
             word_timings.clear()
@@ -259,40 +291,40 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, r
                         "word": word,
                     })
 
-            if audio_bytes:
-                # If edge-tts gave us audio and word timings, return them!
-                # If word timings was empty on this attempt, retry up to 3 attempts.
-                if word_timings:
-                    with open(out_path, "wb") as f:
-                        f.write(audio_bytes)
-                    return word_timings
-                elif attempt == 2:
-                    # Final attempt: write audio even if timings are missing
-                    with open(out_path, "wb") as f:
-                        f.write(audio_bytes)
-                    return []
+            if audio_bytes and len(audio_bytes) > 500:
+                with open(out_path, "wb") as f:
+                    f.write(audio_bytes)
+                return word_timings
 
-        except Exception:
-            await asyncio.sleep(0.5)
+        except Exception as e:
+            err_str = str(e)
+            if "403" in err_str or "Handshake" in err_str:
+                sync_edge_tts_clock()
+
+        await asyncio.sleep(delay)
 
     return []
 
 
 async def generate_tts_chunk(text: str, voice: str, out_path: str, rate: str = None) -> bool:
-    """Generate a single TTS mp3 chunk (audio only). Returns True on success."""
+    """Generate a single TTS mp3 chunk (audio only) with resilient backoff and clock resync."""
     tts_text = clean_for_tts(text)
     if not tts_text:
         return False
     if rate is None:
         rate = get_voice_rate(voice)
-    for attempt in range(3):
+    delays = [1.0, 2.0, 3.5, 5.0, 7.0]
+    for attempt, delay in enumerate(delays):
         try:
             communicate = edge_tts.Communicate(tts_text, voice, rate=rate)
             await communicate.save(out_path)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
                 return True
-        except Exception:
-            await asyncio.sleep(0.5)
+        except Exception as e:
+            err_str = str(e)
+            if "403" in err_str or "Handshake" in err_str:
+                sync_edge_tts_clock()
+        await asyncio.sleep(delay)
     return False
 
 
@@ -1011,10 +1043,11 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
         voice_index = 0
 
         # ── 2. Per-paragraph: TTS with word timings + frames ──────────────────
+        sync_edge_tts_clock()
         for i, para_item in enumerate(para_data):
             text = para_item[0]
             progress_callback(i, total, f"Παράγραφος {i+1}/{total}: TTS + λέξεις…")
-            await asyncio.sleep(0)  # yield to UI
+            await asyncio.sleep(0.25)  # yield to UI and polite cooldown between requests
 
             # Pick voice
             voice = (
@@ -1033,7 +1066,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 chunk_audio_path = os.path.join(temp_dir, f"audio_{i}_{c_idx}.mp3")
                 word_timings = await generate_tts_with_word_timings(chunk, voice, chunk_audio_path)
 
-                if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 0:
+                if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                     post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                     ac = AudioFileClip(chunk_audio_path)
                     chunk_audio_clips.append(ac)
@@ -1046,9 +1079,14 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
 
                     chunk_time_offset += ac.duration
                 else:
-                    # Fallback: plain TTS without timings
+                    # Fallback 1: plain TTS without timings
                     ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
-                    if ok:
+                    if not ok or not os.path.exists(chunk_audio_path) or os.path.getsize(chunk_audio_path) <= 500:
+                        # Fallback 2: try alternative voice (e.g. if one voice is rate-limited)
+                        alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
+                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path)
+
+                    if ok and os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                         post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                         ac = AudioFileClip(chunk_audio_path)
                         chunk_audio_clips.append(ac)
@@ -1062,18 +1100,17 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                 total_duration = combined_audio.duration
                 voice_index += 1
             else:
-                combined_audio = None
-                total_duration = 3.0
+                raise RuntimeError(f"Αποτυχία παραγωγής ήχου για την παράγραφο {i+1}. Παρακαλώ ελέγξτε τη σύνδεση στο διαδίκτυο.")
 
             # ── 3. Align word timings to actual text ──────────────────────────
             is_female_voice = voice in (VOICE_FEMALE, VOICE_EN_FEMALE)
             if all_word_timings:
                 all_word_timings = align_word_timings_to_text(all_word_timings, text)
-            elif ext == 'docx':
+            elif ext == 'docx' and combined_audio is not None and total_duration > 0:
                 # Resilient fallback for DOCX: synthesize proportional word timings
-                # so word highlighting and talking mouth animation NEVER disappear!
+                # only when audio is present so word highlighting and talking mouth animation stay active!
                 words = text.split()
-                if words and total_duration > 0:
+                if words:
                     per_word_dur = total_duration / len(words)
                     all_word_timings = [
                         {
@@ -1371,6 +1408,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
         wp_by_idx = {wp["global_idx"]: wp for wp in word_positions}
 
         # 3. TTS per paragraph with word timings
+        sync_edge_tts_clock()
         all_audio_clips = []
         all_timed_words = []
         accumulated_time = 0.0
@@ -1379,7 +1417,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
 
         for i, para_text in enumerate(paragraphs):
             progress_callback(i, total_paras, f"Παράγραφος {i+1}/{total_paras}: TTS…")
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.25)
 
             voice = (
                 (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
@@ -1398,7 +1436,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                     chunk, voice, chunk_audio_path
                 )
 
-                if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 0:
+                if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                     post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                     ac = AudioFileClip(chunk_audio_path)
                     chunk_audio_clips.append(ac)
@@ -1408,8 +1446,14 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                         para_word_timings.append(shifted)
                     chunk_time_offset += ac.duration
                 else:
+                    # Fallback 1: plain TTS without timings
                     ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
-                    if ok:
+                    if not ok or not os.path.exists(chunk_audio_path) or os.path.getsize(chunk_audio_path) <= 500:
+                        # Fallback 2: try alternative voice
+                        alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
+                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path)
+
+                    if ok and os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                         post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
                         ac = AudioFileClip(chunk_audio_path)
                         chunk_audio_clips.append(ac)
@@ -1424,7 +1468,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                 all_audio_clips.append(combined_audio)
                 voice_index += 1
             else:
-                para_duration = 0.0
+                raise RuntimeError(f"Αποτυχία παραγωγής ήχου για την παράγραφο {i+1} στο Marquee βίντεο.")
 
             # Align word timings and map to global word indices
             if para_word_timings:
@@ -1586,9 +1630,11 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 
     total_paras = len(paragraphs)
     voice_index = 0
+    sync_edge_tts_clock()
 
     try:
         for p_idx, para in enumerate(paragraphs):
+            await asyncio.sleep(0.25)
             voice = (
                 (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
                 if is_english(para)
@@ -1601,7 +1647,11 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
             for c_idx, chunk in enumerate(chunks):
                 temp_file = os.path.join(temp_dir, f"p{p_idx}_c{c_idx}.mp3")
                 ok = await generate_tts_chunk(chunk, voice, temp_file)
-                if ok and os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                if not ok or not os.path.exists(temp_file) or os.path.getsize(temp_file) <= 500:
+                    alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
+                    ok = await generate_tts_chunk(chunk, alt_voice, temp_file)
+
+                if ok and os.path.exists(temp_file) and os.path.getsize(temp_file) > 500:
                     post_process_audio_file(temp_file, warm_eq=True, micro_fade=True, normalize_loudness=False)
                     temp_files.append(temp_file)
                     para_success = True
@@ -1654,13 +1704,14 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.6"
+    APP_VERSION = "1.6.7"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 30
     page.run_task(page.window.center)
+    page.run_task(asyncio.to_thread, sync_edge_tts_clock)
 
 
     # UI Elements
