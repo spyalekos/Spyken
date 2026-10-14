@@ -8,6 +8,9 @@ import os
 import sys
 import tempfile
 import textwrap
+import time
+
+APP_VERSION = "1.6.9"
 
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -35,6 +38,29 @@ def get_voice_rate(voice: str) -> str:
     if voice in (VOICE_FEMALE, VOICE_EN_FEMALE):
         return RATE_FEMALE
     return RATE_MALE
+
+def resolve_voice(voice_str: str, text: str = "") -> str:
+    """Resolves a user-friendly or localized voice name to an Edge-TTS voice identifier."""
+    if not voice_str:
+        return None
+    v = voice_str.strip().lower()
+    is_eng = is_english(text) if text else False
+    if v in ("male", "man", "m", "ανδρας", "άνδρας", "ανδρικη", "ανδρική", "αντρικη", "αντρική"):
+        return VOICE_EN_MALE if is_eng else VOICE_MALE
+    if v in ("female", "woman", "f", "γυναικα", "γυναίκα", "γυναικεια", "γυναικεία"):
+        return VOICE_EN_FEMALE if is_eng else VOICE_FEMALE
+    return voice_str.strip()
+
+def normalize_rate(rate_str: str) -> str:
+    """Normalizes rate string to format like '+10%', '-7%'."""
+    if not rate_str:
+        return None
+    r = rate_str.strip()
+    if not r.endswith("%"):
+        r = f"{r}%"
+    if not r.startswith(("+", "-")):
+        r = f"+{r}"
+    return r
 
 # Video frame resolution
 VIDEO_W = 1280
@@ -989,7 +1015,7 @@ def align_word_timings_to_text(word_timings: list[dict], text: str) -> list[dict
     return timing_words
 
 
-async def convert_to_video(filepath: str, output_path: str, progress_callback):
+async def convert_to_video(filepath: str, output_path: str, progress_callback, voice_override: str = None, rate_override: str = None):
     """
     Master function: extract paragraphs (with positions for PDF),
     generate TTS per paragraph with word timings, build per-word video frames,
@@ -1050,11 +1076,16 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             await asyncio.sleep(0.25)  # yield to UI and polite cooldown between requests
 
             # Pick voice
-            voice = (
-                (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
-                if is_english(text)
-                else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
-            )
+            if voice_override:
+                voice = resolve_voice(voice_override, text)
+            else:
+                voice = (
+                    (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
+                    if is_english(text)
+                    else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
+                )
+
+            current_rate = rate_override if rate_override else get_voice_rate(voice)
 
             # For long paragraphs we chunk the text
             chunks = chunk_text(text, 800)
@@ -1064,7 +1095,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
 
             for c_idx, chunk in enumerate(chunks):
                 chunk_audio_path = os.path.join(temp_dir, f"audio_{i}_{c_idx}.mp3")
-                word_timings = await generate_tts_with_word_timings(chunk, voice, chunk_audio_path)
+                word_timings = await generate_tts_with_word_timings(chunk, voice, chunk_audio_path, rate=current_rate)
 
                 if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                     post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
@@ -1080,11 +1111,12 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
                     chunk_time_offset += ac.duration
                 else:
                     # Fallback 1: plain TTS without timings
-                    ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
+                    ok = await generate_tts_chunk(chunk, voice, chunk_audio_path, rate=current_rate)
                     if not ok or not os.path.exists(chunk_audio_path) or os.path.getsize(chunk_audio_path) <= 500:
                         # Fallback 2: try alternative voice (e.g. if one voice is rate-limited)
                         alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
-                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path)
+                        alt_rate = rate_override if rate_override else get_voice_rate(alt_voice)
+                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path, rate=alt_rate)
 
                     if ok and os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                         post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
@@ -1364,7 +1396,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback):
             pass
 
 
-async def convert_to_marquee_video(filepath: str, output_path: str, progress_callback):
+async def convert_to_marquee_video(filepath: str, output_path: str, progress_callback, voice_override: str = None, rate_override: str = None):
     """
     Create a marquee-style video (MARQUEE_W × MARQUEE_H): text-only vertical
     scroll with word-level highlighting synchronized to TTS audio.
@@ -1419,11 +1451,16 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
             progress_callback(i, total_paras, f"Παράγραφος {i+1}/{total_paras}: TTS…")
             await asyncio.sleep(0.25)
 
-            voice = (
-                (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
-                if is_english(para_text)
-                else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
-            )
+            if voice_override:
+                voice = resolve_voice(voice_override, para_text)
+            else:
+                voice = (
+                    (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
+                    if is_english(para_text)
+                    else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
+                )
+
+            current_rate = rate_override if rate_override else get_voice_rate(voice)
 
             chunks = chunk_text(para_text, 800)
             chunk_audio_clips = []
@@ -1433,7 +1470,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
             for c_idx, chunk in enumerate(chunks):
                 chunk_audio_path = os.path.join(temp_dir, f"mq_audio_{i}_{c_idx}.mp3")
                 word_timings = await generate_tts_with_word_timings(
-                    chunk, voice, chunk_audio_path
+                    chunk, voice, chunk_audio_path, rate=current_rate
                 )
 
                 if os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
@@ -1447,11 +1484,12 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                     chunk_time_offset += ac.duration
                 else:
                     # Fallback 1: plain TTS without timings
-                    ok = await generate_tts_chunk(chunk, voice, chunk_audio_path)
+                    ok = await generate_tts_chunk(chunk, voice, chunk_audio_path, rate=current_rate)
                     if not ok or not os.path.exists(chunk_audio_path) or os.path.getsize(chunk_audio_path) <= 500:
                         # Fallback 2: try alternative voice
                         alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
-                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path)
+                        alt_rate = rate_override if rate_override else get_voice_rate(alt_voice)
+                        ok = await generate_tts_chunk(chunk, alt_voice, chunk_audio_path, rate=alt_rate)
 
                     if ok and os.path.exists(chunk_audio_path) and os.path.getsize(chunk_audio_path) > 500:
                         post_process_audio_file(chunk_audio_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
@@ -1616,7 +1654,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
 
 # ──────────────────────────── AUDIO CONVERSION ────────────────────────────────
 
-async def convert_to_audio(paragraphs: list[str], output_path: str, progress_callback):
+async def convert_to_audio(paragraphs: list[str], output_path: str, progress_callback, voice_override: str = None, rate_override: str = None):
     """
     Generates seamless, natural MP3 speech audio from paragraphs:
     - Alternates male and female voices per paragraph.
@@ -1635,21 +1673,26 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
     try:
         for p_idx, para in enumerate(paragraphs):
             await asyncio.sleep(0.25)
-            voice = (
-                (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
-                if is_english(para)
-                else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
-            )
+            if voice_override:
+                voice = resolve_voice(voice_override, para)
+            else:
+                voice = (
+                    (VOICE_EN_MALE if voice_index % 2 == 0 else VOICE_EN_FEMALE)
+                    if is_english(para)
+                    else (VOICE_MALE if voice_index % 2 == 0 else VOICE_FEMALE)
+                )
 
+            current_rate = rate_override if rate_override else get_voice_rate(voice)
             chunks = chunk_text(para, 800)
             para_success = False
 
             for c_idx, chunk in enumerate(chunks):
                 temp_file = os.path.join(temp_dir, f"p{p_idx}_c{c_idx}.mp3")
-                ok = await generate_tts_chunk(chunk, voice, temp_file)
+                ok = await generate_tts_chunk(chunk, voice, temp_file, rate=current_rate)
                 if not ok or not os.path.exists(temp_file) or os.path.getsize(temp_file) <= 500:
                     alt_voice = VOICE_MALE if voice == VOICE_FEMALE else (VOICE_FEMALE if voice == VOICE_MALE else voice)
-                    ok = await generate_tts_chunk(chunk, alt_voice, temp_file)
+                    alt_rate = rate_override if rate_override else get_voice_rate(alt_voice)
+                    ok = await generate_tts_chunk(chunk, alt_voice, temp_file, rate=alt_rate)
 
                 if ok and os.path.exists(temp_file) and os.path.getsize(temp_file) > 500:
                     post_process_audio_file(temp_file, warm_eq=True, micro_fade=True, normalize_loudness=False)
@@ -1704,7 +1747,6 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    APP_VERSION = "1.6.7"
     page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
     page.window.width = 680
     page.window.height = 740
@@ -2046,6 +2088,7 @@ def main(page: ft.Page):
                         ft.Text("• Μετατροπή σε MP4: Βίντεο παρουσίασης (1280×720) με οπτική προβολή των σελίδων PDF ή παραγράφων DOCX. Στα έγγραφα DOCX ενσωματώνεται διαδραστικός καρτούν-δάσκαλος avatar με δυναμική κίνηση ομιλίας συγχρονισμένη με την εκφώνηση και πράσινο φωτισμό κάθε λέξης.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Marquee Video: Οριζόντιο banner (1920×108) με οριζόντια κυλιόμενο κείμενο και πράσινο φωσφορίζον highlight στην ενεργή λέξη. Ιδανικό για tickers και επικαλύψεις βίντεο.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("• Έξυπνη Ανίχνευση Γλώσσας: Αυτόματη εναλλαγή μεταξύ Ελληνικών και Αγγλικών φωνών ανάλογα με το κείμενο.", size=13, color=ft.Colors.GREY_300),
+                        ft.Text("• Πλήρης Γραμμή Εντολών (Headless CLI): Όλες οι λειτουργίες (εκφώνηση κειμένου, μετατροπή αρχείων σε MP3, MP4 ή Marquee Video) εκτελούνται απευθείας από το τερματικό χωρίς άνοιγμα του παραθύρου.", size=13, color=ft.Colors.GREY_300),
                         
                         ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         
@@ -2055,6 +2098,7 @@ def main(page: ft.Page):
                         ft.Text("2. Εκτέλεση Μετατροπής: Πατήστε ένα από τα τρία κουμπιά (MP3, MP4, Marquee Video) για να ξεκινήσει η επεξεργασία.", size=13, color=ft.Colors.GREY_300),
                         ft.Text("3. Αποθήκευση: Τα παραγόμενα αρχεία αποθηκεύονται αυτόματα στον ίδιο φάκελο με τα αρχικά σας έγγραφα με κατάλληλη ονοματολογία (_marquee.mp4, .mp4, .mp3).", size=13, color=ft.Colors.GREY_300),
                         ft.Text("4. Καθαρισμός: Πατήστε 'Καθαρισμός' αν θέλετε να αδειάσετε τη λίστα των επιλεγμένων αρχείων σας.", size=13, color=ft.Colors.GREY_300),
+                        ft.Text("5. Χρήση από Τερματικό (CLI): Εκτελέστε 'Spyken.exe -h' ή 'Spyken.exe -v αρχείο.docx' απευθείας από τη γραμμή εντολών.", size=13, color=ft.Colors.GREY_300),
                         
                         ft.Divider(height=10, color=ft.Colors.WHITE_24),
                         
@@ -2210,17 +2254,103 @@ def play_audio_windows(file_path: str):
     return True
 
 
-async def run_cli_async(text: str):
-    voice = VOICE_EN_FEMALE if is_english(text) else VOICE_FEMALE
+def setup_windows_console():
+    """Ensure standard output streams work cleanly in Windows console."""
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # If stdout/stderr are already piped or redirected (e.g. from PowerShell or CMD pipe)
+    if sys.stdout is not None:
+        try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr is not None:
+        try:
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    # If sys.stdout is None (standard PyInstaller GUI subsystem: console=False)
+    if sys.stdout is None:
+        ATTACH_PARENT_PROCESS = 0xFFFFFFFF
+        kernel32.AttachConsole.argtypes = [wintypes.DWORD]
+        kernel32.AttachConsole.restype = wintypes.BOOL
+
+        attached = kernel32.AttachConsole(ATTACH_PARENT_PROCESS)
+        if attached:
+            try:
+                kernel32.SetConsoleOutputCP(65001)
+                kernel32.SetConsoleCP(65001)
+            except Exception:
+                pass
+            try:
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+                sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+def create_temp_docx(text: str) -> str:
+    """Creates a temporary .docx file with text paragraphs for video rendering."""
+    temp_dir = tempfile.gettempdir()
+    temp_docx = os.path.join(temp_dir, f"spyken_cli_text_{os.getpid()}_{int(time.time() * 1000)}.docx")
+    doc = docx.Document()
+    paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
+    if not paragraphs and text.strip():
+        paragraphs = [text.strip()]
+    for p in paragraphs:
+        doc.add_paragraph(p)
+    doc.save(temp_docx)
+    return temp_docx
+
+
+def cli_progress_callback(current, total, msg=""):
+    """Command-line progress callback reporting percentage and current phase."""
+    pct = int((current / max(total, 1)) * 100) if total > 0 else 0
+    if msg:
+        status_line = f"\r[{pct:3d}%] {msg}"
+    else:
+        status_line = f"\r[{pct:3d}%] Επεξεργασία {current}/{total}..."
+    try:
+        sys.stdout.write(status_line.ljust(75))
+        sys.stdout.flush()
+        if current >= total and total > 0 and ("100%" in msg or current == total):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+async def run_cli_async(text: str, voice_override: str = None, rate_override: str = None):
+    """Plays text speech directly through speakers via Windows MCI API."""
+    if voice_override:
+        voice = resolve_voice(voice_override, text)
+    else:
+        voice = VOICE_EN_FEMALE if is_english(text) else VOICE_FEMALE
+    rate = rate_override if rate_override else get_voice_rate(voice)
     print(f"Εκφώνηση: \"{text}\"")
-    print(f"Φωνή: {voice}")
+    print(f"Φωνή: {voice} (Ρυθμός: {rate})")
     
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, f"spyken_cli_temp_{os.getpid()}.mp3")
     
     try:
         print("Δημιουργία αρχείου ήχου...")
-        ok = await generate_tts_chunk(text, voice, temp_path)
+        ok = await generate_tts_chunk(text, voice, temp_path, rate=rate)
         if ok and os.path.exists(temp_path):
             post_process_audio_file(temp_path, warm_eq=True, micro_fade=True, normalize_loudness=True)
             print("Αναπαραγωγή...")
@@ -2238,6 +2368,334 @@ async def run_cli_async(text: str):
                 pass
 
 
+def print_cli_help():
+    """Prints comprehensive, beautifully formatted command line usage guide."""
+    help_text = f"""Spyken v{APP_VERSION} - Μετατροπή Εγγράφων σε Ήχο (MP3) & Βίντεο (MP4)
+
+ΧΡΗΣΗ:
+  spyken [ΕΠΙΛΟΓΕΣ] [ΑΡΧΕΙΑ... | ΚΕΙΜΕΝΟ]
+
+ΠΕΡΙΓΡΑΦΗ:
+  Εκφωνεί κείμενο απευθείας από τα ηχεία ή μετατρέπει έγγραφα (.docx, .pdf)
+  και απευθείας κείμενο σε αρχεία ήχου MP3, βίντεο παρουσίασης MP4 (με συγχρονισμένο
+  καρτούν δάσκαλο/δασκάλα avatar και πράσινο φωτισμό λέξεων), ή οριζόντιο
+  κυλιόμενο Marquee Banner MP4 (1920x108).
+  Χωρίς ορίσματα εκκινεί το γραφικό περιβάλλον (GUI).
+
+ΕΠΙΛΟΓΕΣ ΕΝΕΡΓΕΙΑΣ:
+  -s, --speak                Εκφώνηση κειμένου απευθείας από τα ηχεία (προεπιλογή για κείμενο)
+  -a, --audio, --mp3         Μετατροπή σε αρχείο ήχου MP3 (.mp3)
+  -v, --video, --mp4         Μετατροπή σε βίντεο παρουσίασης MP4 (.mp4)
+  -m, --marquee              Μετατροπή σε οριζόντιο κυλιόμενο Marquee Banner MP4 (.mp4)
+
+ΕΠΙΛΟΓΕΣ ΕΙΣΟΔΟΥ & ΕΞΟΔΟΥ:
+  -t, --text ΚΕΙΜΕΝΟ         Απευθείας εισαγωγή κειμένου για μετατροπή ή εκφώνηση
+  -i, --input ΑΡΧΕΙΑ...      Ένα ή περισσότερα αρχεία εισόδου (.docx, .pdf)
+  -o, --output ΔΙΑΔΡΟΜΗ      Όνομα αρχείου εξόδου ή φάκελος προορισμού
+
+ΠΑΡΑΜΕΤΡΟΙ ΦΩΝΗΣ & ΗΧΟΥ:
+  --voice ΦΩΝΗ               Επιλογή φωνής: 'male'/'ανδρική', 'female'/'γυναικεία',
+                             ή όνομα φωνής Edge-TTS (π.χ. el-GR-NestorasNeural)
+  -r, --rate ΡΥΘΜΟΣ          Ρύθμιση ταχύτητας ομιλίας (π.χ. +10%, -10%, +20%)
+
+ΓΕΝΙΚΕΣ ΕΠΙΛΟΓΕΣ:
+  -h, --help                 Εμφάνιση αυτού του μηνύματος βοήθειας
+  -V, --version              Εμφάνιση της έκδοσης της εφαρμογής
+  --gui                      Εκκίνηση του γραφικού περιβάλλοντος (GUI)
+
+ΠΑΡΑΔΕΙΓΜΑΤΑ ΧΡΗΣΗΣ:
+  • Απλή εκφώνηση κειμένου από τα ηχεία (υπάρχουσα λειτουργικότητα):
+      Spyken.exe "Καλημέρα σας, καλή εβδομάδα!"
+      Spyken.exe -s "Κείμενο προς εκφώνηση" --voice male --rate +10%
+
+  • Μετατροπή εγγράφου σε ήχο MP3:
+      Spyken.exe -a document.docx
+      Spyken.exe --audio document.pdf -o "C:\\Audio\\podcast.mp3"
+
+  • Μετατροπή εγγράφου σε βίντεο παρουσίασης MP4 (με avatar δασκάλου):
+      Spyken.exe -v document.docx
+      Spyken.exe --video presentation.docx -o presentation.mp4
+
+  • Μετατροπή εγγράφου σε οριζόντιο Marquee Banner MP4 (1920x108):
+      Spyken.exe -m document.docx
+      Spyken.exe --marquee news.pdf -o news_ticker.mp4
+
+  • Μετατροπή απευθείας κειμένου σε αρχείο:
+      Spyken.exe -a -t "Κείμενο για αποθήκευση σε ήχο" -o audio.mp3
+      Spyken.exe -v -t "Κείμενο για δημιουργία βίντεο" -o video.mp4
+
+  • Μαζική μετατροπή πολλαπλών αρχείων:
+      Spyken.exe -a file1.docx file2.pdf
+      Spyken.exe -v *.docx
+"""
+    print(help_text)
+
+
+async def cli_process_text(text: str, mode: str, output_path: str = None, voice: str = None, rate: str = None) -> int:
+    """Processes plain text input from CLI into MP3 audio or MP4 video."""
+    text = text.strip()
+    if not text:
+        print("Σφάλμα: Το κείμενο είναι κενό.")
+        return 1
+
+    if mode == "audio":
+        if not output_path:
+            output_path = "output.mp3"
+        print(f"Spyken: Μετατροπή κειμένου σε ήχο MP3 -> {output_path}")
+        paragraphs = [clean_document_text(p) for p in text.splitlines() if is_valid_text(clean_document_text(p))]
+        if not paragraphs and is_valid_text(text):
+            paragraphs = [clean_document_text(text)]
+        if not paragraphs:
+            print("Σφάλμα: Το κείμενο δεν περιέχει έγκυρες παραγράφους.")
+            return 1
+        try:
+            await convert_to_audio(paragraphs, output_path, cli_progress_callback, voice_override=voice, rate_override=rate)
+            print(f"\n[OK] Ολοκληρώθηκε με επιτυχία: {output_path}")
+            return 0
+        except Exception as e:
+            print(f"\n[ΣΦΑΛΜΑ] {e}")
+            return 1
+
+    elif mode in ("video", "marquee"):
+        default_ext = "_marquee.mp4" if mode == "marquee" else ".mp4"
+        if not output_path:
+            output_path = f"output{default_ext}"
+        mode_label = "Marquee Video" if mode == "marquee" else "Βίντεο Παρουσίασης MP4"
+        print(f"Spyken: Μετατροπή κειμένου σε {mode_label} -> {output_path}")
+
+        temp_docx = create_temp_docx(text)
+        try:
+            if mode == "marquee":
+                await convert_to_marquee_video(temp_docx, output_path, cli_progress_callback, voice_override=voice, rate_override=rate)
+            else:
+                await convert_to_video(temp_docx, output_path, cli_progress_callback, voice_override=voice, rate_override=rate)
+            print(f"\n[OK] Ολοκληρώθηκε με επιτυχία: {output_path}")
+            return 0
+        except Exception as e:
+            print(f"\n[ΣΦΑΛΜΑ] {e}")
+            return 1
+        finally:
+            if os.path.exists(temp_docx):
+                try:
+                    os.remove(temp_docx)
+                except Exception:
+                    pass
+    return 0
+
+
+async def cli_process_documents(files: list[str], mode: str, output_dest: str = None, voice: str = None, rate: str = None) -> int:
+    """Processes document files (.docx, .pdf) in CLI mode."""
+    valid_files = []
+    for f in files:
+        if not os.path.exists(f):
+            print(f"[ΠΡΟΕΙΔΟΠΟΙΗΣΗ] Το αρχείο δεν βρέθηκε: {f}")
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in (".docx", ".pdf"):
+            print(f"[ΠΡΟΕΙΔΟΠΟΙΗΣΗ] Μη υποστηριζόμενος τύπος αρχείου (μόνο .docx και .pdf): {f}")
+            continue
+        valid_files.append(os.path.abspath(f))
+
+    if not valid_files:
+        print("Σφάλμα: Δεν βρέθηκαν έγκυρα αρχεία (.docx ή .pdf).")
+        return 1
+
+    total_files = len(valid_files)
+    success_count = 0
+
+    mode_label = {
+        "audio": "Ήχο MP3",
+        "video": "Βίντεο MP4",
+        "marquee": "Marquee Video"
+    }.get(mode, mode)
+
+    print(f"\n=== Έναρξη επεξεργασίας {total_files} αρχείων σε {mode_label} ===")
+
+    for idx, filepath in enumerate(valid_files, start=1):
+        filename = os.path.basename(filepath)
+        print(f"\n[{idx}/{total_files}] Επεξεργασία: {filename}")
+
+        # Determine target output path
+        if output_dest and total_files == 1 and not (os.path.isdir(output_dest) or output_dest.endswith(("/", "\\"))):
+            target_out = os.path.abspath(output_dest)
+        else:
+            base_name, _ = os.path.splitext(filepath)
+            suffix = ".mp3" if mode == "audio" else ("_marquee.mp4" if mode == "marquee" else ".mp4")
+            out_filename = os.path.basename(base_name) + suffix
+            if output_dest:
+                os.makedirs(output_dest, exist_ok=True)
+                target_out = os.path.join(os.path.abspath(output_dest), out_filename)
+            else:
+                target_out = os.path.join(os.path.dirname(filepath), out_filename)
+
+        print(f"    Αρχείο εξόδου: {target_out}")
+
+        try:
+            if mode == "audio":
+                paragraphs = extract_paragraphs(filepath)
+                if not paragraphs:
+                    print(f"    [ΣΦΑΛΜΑ] Δεν βρέθηκε κείμενο στο αρχείο {filename}")
+                    continue
+                await convert_to_audio(paragraphs, target_out, cli_progress_callback, voice_override=voice, rate_override=rate)
+            elif mode == "video":
+                await convert_to_video(filepath, target_out, cli_progress_callback, voice_override=voice, rate_override=rate)
+            elif mode == "marquee":
+                await convert_to_marquee_video(filepath, target_out, cli_progress_callback, voice_override=voice, rate_override=rate)
+
+            if os.path.exists(target_out) and os.path.getsize(target_out) > 0:
+                print(f"    [OK] Επιτυχής δημιουργία: {os.path.basename(target_out)} ({os.path.getsize(target_out):,} bytes)")
+                success_count += 1
+            else:
+                print(f"    [ΣΦΑΛΜΑ] Το αρχείο εξόδου δεν δημιουργήθηκε σωστά.")
+        except Exception as e:
+            print(f"    [ΣΦΑΛΜΑ] {e}")
+
+    print(f"\n=== Ολοκληρώθηκαν {success_count}/{total_files} αρχεία ===")
+    return 0 if success_count > 0 else 1
+
+
+def cli_main(raw_args: list[str]) -> int:
+    """Master CLI dispatcher supporting both flags and direct text speech."""
+    if not raw_args:
+        return 0
+
+    if any(a.lower() in ("-h", "--help", "/h", "/?", "-help", "--βοηθεια", "--βοήθεια") for a in raw_args):
+        print_cli_help()
+        return 0
+
+    if any(a in ("-V", "--version", "-version", "/v", "/version") for a in raw_args if a not in ("-v",)):
+        print(f"Spyken v{APP_VERSION}")
+        return 0
+
+    if "--gui" in raw_args:
+        return -1
+
+    # Check if any flags starting with '-' or '/' are present
+    has_flags = any(a.startswith(("-", "/")) for a in raw_args)
+    if not has_flags:
+        # Check if all items are existing docx or pdf files
+        all_are_docs = (
+            len(raw_args) > 0 and
+            all(os.path.isfile(a) and a.lower().endswith((".docx", ".pdf")) for a in raw_args)
+        )
+        if all_are_docs:
+            print(f"Spyken v{APP_VERSION} - Μαζική μετατροπή σε ήχο MP3...")
+            print("Σημείωση: Χρησιμοποιήστε -v για βίντεο MP4 ή -m για Marquee Video.")
+            return asyncio.run(cli_process_documents(raw_args, mode="audio", output_dest=None, voice=None, rate=None))
+        else:
+            # Plain text speech playback (100% backward compatible!)
+            text_to_speak = " ".join(raw_args).strip()
+            if text_to_speak:
+                asyncio.run(run_cli_async(text_to_speak))
+            return 0
+
+    # Parse arguments with argparse
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-a", "--audio", "--mp3", action="store_true")
+    parser.add_argument("-v", "--video", "--mp4", action="store_true")
+    parser.add_argument("-m", "--marquee", action="store_true")
+    parser.add_argument("-s", "--speak", action="store_true")
+    parser.add_argument("-t", "--text", type=str, default=None)
+    parser.add_argument("-i", "--input", nargs="*", default=[])
+    parser.add_argument("-o", "--output", type=str, default=None)
+    parser.add_argument("--voice", type=str, default=None)
+    parser.add_argument("-r", "--rate", type=str, default=None)
+    parser.add_argument("-V", "--version", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--gui", action="store_true")
+    parser.add_argument("positional", nargs="*", default=[])
+
+    try:
+        parsed, remaining = parser.parse_known_args(raw_args)
+    except Exception as e:
+        print(f"Σφάλμα παραμέτρων: {e}")
+        print("Εκτελέστε 'spyken --help' για αναλυτικές οδηγίες χρήσης.")
+        return 1
+
+    if parsed.help:
+        print_cli_help()
+        return 0
+
+    if parsed.version:
+        print(f"Spyken v{APP_VERSION}")
+        return 0
+
+    if parsed.gui:
+        return -1
+
+    voice_opt = resolve_voice(parsed.voice) if parsed.voice else None
+    rate_opt = normalize_rate(parsed.rate) if parsed.rate else None
+
+    # Collect inputs
+    all_inputs = []
+    if parsed.input:
+        all_inputs.extend(parsed.input)
+    if parsed.positional:
+        all_inputs.extend(parsed.positional)
+    if remaining:
+        all_inputs.extend(remaining)
+
+    # Resolve globbing for files
+    import glob
+    expanded_files = []
+    for item in all_inputs:
+        if any(c in item for c in ("*", "?")):
+            matched = glob.glob(item)
+            if matched:
+                expanded_files.extend(matched)
+            else:
+                expanded_files.append(item)
+        else:
+            expanded_files.append(item)
+
+    # Determine mode
+    mode = None
+    if parsed.audio:
+        mode = "audio"
+    elif parsed.video:
+        mode = "video"
+    elif parsed.marquee:
+        mode = "marquee"
+    elif parsed.speak:
+        mode = "speak"
+
+    text_input = parsed.text
+
+    # If no mode explicitly set:
+    if mode is None:
+        if text_input:
+            mode = "speak"
+        elif expanded_files and all(os.path.isfile(f) and f.lower().endswith((".docx", ".pdf")) for f in expanded_files):
+            mode = "audio"
+        elif expanded_files:
+            text_input = " ".join(expanded_files).strip()
+            mode = "speak"
+        else:
+            print_cli_help()
+            return 0
+
+    # Execute determined mode
+    if mode == "speak":
+        if not text_input and expanded_files:
+            text_input = " ".join(expanded_files).strip()
+        if not text_input:
+            print("Σφάλμα: Δεν δόθηκε κείμενο προς εκφώνηση.")
+            return 1
+        asyncio.run(run_cli_async(text_input, voice_override=voice_opt, rate_override=rate_opt))
+        return 0
+
+    if text_input and not expanded_files:
+        return asyncio.run(cli_process_text(text_input, mode=mode, output_path=parsed.output, voice=voice_opt, rate=rate_opt))
+
+    if not expanded_files:
+        print("Σφάλμα: Δεν ορίστηκαν αρχεία εισόδου ή κείμενο.")
+        print("Εκτελέστε 'spyken --help' για βοήθεια.")
+        return 1
+
+    return asyncio.run(cli_process_documents(expanded_files, mode=mode, output_dest=parsed.output, voice=voice_opt, rate=rate_opt))
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Close PyInstaller Splash screen immediately if running from command line
@@ -2246,18 +2704,10 @@ if __name__ == "__main__":
             pyi_splash.close()
         except ImportError:
             pass
-            
-        text_arg = " ".join(sys.argv[1:])
-        if text_arg.strip().lower() in ("--help", "-h", "/h", "/help"):
-            print("Spyken - Text to Speech & Video Generator")
-            print("Χρήση μέσω γραμμής εντολών:")
-            print("  spyken.exe \"Κείμενο προς εκφώνηση\"")
-            print("Παράδειγμα:")
-            print("  spyken.exe \"Καλημέρα, καλή εβδομάδα και καλό μήνα\"")
-            sys.exit(0)
-            
-        if text_arg.strip():
-            asyncio.run(run_cli_async(text_arg))
-            sys.exit(0)
-            
+
+        setup_windows_console()
+        ret = cli_main(sys.argv[1:])
+        if ret != -1:
+            sys.exit(ret)
+
     ft.run(main, assets_dir=get_asset_path("assets"))
