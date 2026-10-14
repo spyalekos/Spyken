@@ -10,7 +10,7 @@ import tempfile
 import textwrap
 import time
 
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.7.0"
 
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
