@@ -10,7 +10,7 @@ import tempfile
 import textwrap
 import time
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -972,16 +972,20 @@ def get_mp3_duration(path: str) -> float:
 
 # ─────────────────────── WORD-TIMING ALIGNMENT ────────────────────────────────
 
-def align_word_timings_to_text(word_timings: list[dict], text: str) -> list[dict]:
+def align_word_timings_to_text(word_timings: list[dict], text: str, total_duration: float = 0.0) -> list[dict]:
     """
     The TTS engine may return WordBoundary words in a slightly different order
     or with punctuation stripped. We do a best-effort match of timing words
     to the actual words in `text` so that highlights correspond to visible tokens.
+    If Edge-TTS omitted or dropped trailing words before paragraph end,
+    interpolates timestamps so that every single word in text is highlighted!
 
-    Returns same list but with 'text_word' and 'text_word_idx' keys containing the
+    Returns list with 'text_word' and 'text_word_idx' keys containing the
     original word and its index from the text (or default/fallback if no match found).
     """
     text_words = text.split()
+    if not text_words:
+        return []
     timing_words = [t.copy() for t in word_timings]
 
     def _normalize(w: str) -> str:
@@ -998,21 +1002,38 @@ def align_word_timings_to_text(word_timings: list[dict], text: str) -> list[dict
         # Advance text_words pointer to find the best match
         norm_tw = _normalize(tw["word"])
         matched = False
-        for offset in range(min(12, len(text_words) - t_idx)):
-            candidate = _normalize(text_words[t_idx + offset])
+        for offset in range(min(25, len(text_words) - t_idx)):
+            idx = t_idx + offset
+            candidate = _normalize(text_words[idx])
             if candidate == norm_tw or (
                 norm_tw and candidate and (norm_tw in candidate or candidate in norm_tw)
             ):
-                tw["text_word"] = text_words[t_idx + offset]
-                tw["text_word_idx"] = t_idx + offset
-                t_idx = t_idx + offset + 1
+                tw["text_word"] = text_words[idx]
+                tw["text_word_idx"] = idx
+                t_idx = idx + 1
                 matched = True
                 break
         if not matched:
             tw["text_word"] = tw["word"]
             tw["text_word_idx"] = -1
 
+    # Fill in any trailing words that edge-tts omitted or dropped before paragraph end
+    if timing_words and total_duration > 0 and t_idx < len(text_words):
+        last_offset = timing_words[-1]["offset_s"] + max(0.1, timing_words[-1].get("duration_s", 0.3))
+        remaining_count = len(text_words) - t_idx
+        rem_dur = max(0.0, total_duration - last_offset)
+        step = rem_dur / max(remaining_count, 1) if (rem_dur > 0 and remaining_count > 0) else 0.2
+        for i, word in enumerate(text_words[t_idx:]):
+            timing_words.append({
+                "offset_s": last_offset + i * step,
+                "duration_s": step,
+                "word": word,
+                "text_word": word,
+                "text_word_idx": t_idx + i,
+            })
+
     return timing_words
+
 
 
 async def convert_to_video(filepath: str, output_path: str, progress_callback, voice_override: str = None, rate_override: str = None):
@@ -1137,7 +1158,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
             # ── 3. Align word timings to actual text ──────────────────────────
             is_female_voice = voice in (VOICE_FEMALE, VOICE_EN_FEMALE)
             if all_word_timings:
-                all_word_timings = align_word_timings_to_text(all_word_timings, text)
+                all_word_timings = align_word_timings_to_text(all_word_timings, text, total_duration)
             elif ext == 'docx' and combined_audio is not None and total_duration > 0:
                 # Resilient fallback for DOCX: synthesize proportional word timings
                 # only when audio is present so word highlighting and talking mouth animation stay active!
@@ -1197,7 +1218,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                         if w_idx < n_timings - 1:
                             clip_dur = all_word_timings[w_idx + 1]["offset_s"] - wt["offset_s"]
                         else:
-                            clip_dur = total_duration - wt["offset_s"]
+                            clip_dur = max(0.04, total_duration - wt["offset_s"])
                         if clip_dur < 0.04:
                             clip_dur = 0.04
 
@@ -1230,8 +1251,9 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                         import numpy as np
                         from PIL import Image, ImageDraw
                         base_np = np.array(base.convert("RGB"))
-                        # Cache for highlighted frames (key: rect as tuple)
+                        # Bounded cache for highlighted frames to prevent RAM exhaustion
                         cache = {None: base_np}
+                        MAX_CACHE = 8
 
                         def make_frame(t):
                             active_rect = None
@@ -1244,6 +1266,15 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                             rect_key = (active_rect.x0, active_rect.y0, active_rect.x1, active_rect.y1) if active_rect else None
                             
                             if rect_key not in cache:
+                                while len(cache) >= MAX_CACHE:
+                                    evicted = False
+                                    for k in list(cache.keys()):
+                                        if k is not None:
+                                            del cache[k]
+                                            evicted = True
+                                            break
+                                    if not evicted:
+                                        break
                                 # Render this highlight ONCE and cache it
                                 frame_img = base.copy()
                                 overlay = Image.new("RGBA", (VIDEO_W, VIDEO_H), (0, 0, 0, 0))
@@ -1272,7 +1303,7 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                         if w_idx < n_timings - 1:
                             clip_dur = all_word_timings[w_idx + 1]["offset_s"] - wt["offset_s"]
                         else:
-                            clip_dur = total_duration - wt["offset_s"]
+                            clip_dur = max(0.04, total_duration - wt["offset_s"])
                         if clip_dur < 0.04:
                             clip_dur = 0.04
 
@@ -1285,7 +1316,11 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
 
                     def create_docx_frame_func(wrt, p_text, p_idx, p_total, female):
                         import numpy as np
+                        # Bounded sliding-window frame cache (max 6 frames)
+                        # Prevents runaway RAM accumulation and 2.64 MiB allocation errors across 50+ paragraphs
                         cache = {}
+                        MAX_CACHE = 6
+
                         def make_frame_docx(t):
                             active_word = None
                             active_word_idx = -1
@@ -1302,22 +1337,33 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                                 mouth_state = -1
 
                             cache_key = (active_word, active_word_idx, mouth_state, female)
-                            if cache_key not in cache:
-                                img = render_docx_paragraph_image(
-                                    p_text, p_idx, p_total,
-                                    highlight_word=active_word,
-                                    highlight_word_idx=active_word_idx,
-                                    mouth_state=mouth_state,
-                                    is_female=female
-                                )
-                                cache[cache_key] = np.array(img.convert("RGB"))
-                            
-                            return cache[cache_key]
+                            if cache_key in cache:
+                                return cache[cache_key]
+
+                            # Evict old frames when cache exceeds capacity
+                            if active_word is None and len(cache) > 1:
+                                cache.clear()
+                            else:
+                                while len(cache) >= MAX_CACHE:
+                                    del cache[next(iter(cache))]
+
+                            img = render_docx_paragraph_image(
+                                p_text, p_idx, p_total,
+                                highlight_word=active_word,
+                                highlight_word_idx=active_word_idx,
+                                mouth_state=mouth_state,
+                                is_female=female
+                            )
+                            frame_np = np.array(img.convert("RGB"))
+                            cache[cache_key] = frame_np
+                            return frame_np
+
                         return make_frame_docx
 
                     docx_f = create_docx_frame_func(word_render_timings, text, para_idx, total, is_female_voice)
                     para_clip_duration = (total_duration + VIDEO_TAIL_BUFFER_SEC) if (i == total - 1) else (total_duration + PARAGRAPH_PAUSE_SEC)
                     para_clips.append(VideoClip(docx_f, duration=para_clip_duration))
+
 
                 # No gap-fill needed: offset-based durations already cover total_duration
 
@@ -1360,12 +1406,17 @@ async def convert_to_video(filepath: str, output_path: str, progress_callback, v
                 para_video = para_video.with_audio(combined_audio)
 
             clips.append(para_video)
+            import gc
+            gc.collect()
 
         # ── 6. Assemble final video ────────────────────────────────────────────
         progress_callback(total, total, "Συναρμολόγηση βίντεο...")
         await asyncio.sleep(0)
+        import gc
+        gc.collect()
 
         ui_logger = FletMoviepyLogger(progress_callback)
+
 
         final = concatenate_videoclips(clips, method="chain")
 
@@ -1566,6 +1617,7 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
             import numpy as np
             from PIL import ImageDraw
             cache = {}
+            MAX_CACHE = 8
 
             def make_frame(t):
                 active_g_idx = -1
@@ -1577,6 +1629,9 @@ async def convert_to_marquee_video(filepath: str, output_path: str, progress_cal
                 cache_key = active_g_idx
                 if cache_key in cache:
                     return cache[cache_key]
+
+                while len(cache) >= MAX_CACHE:
+                    del cache[next(iter(cache))]
 
                 # Determine horizontal scroll position based on active word
                 if active_g_idx >= 0 and active_g_idx in wp_idx:
@@ -1915,6 +1970,7 @@ def main(page: ft.Page):
         progress_bar.value = 0
         page.update()
 
+        has_error = False
         for filepath in file_queue:
             ext = filepath.lower().split('.')[-1]
             status_text.value = f"Εξαγωγή κειμένου: {os.path.basename(filepath)}"
@@ -1930,6 +1986,7 @@ def main(page: ft.Page):
                 paragraphs = extract_paragraphs(filepath)
                 if not paragraphs:
                     log(f"Δεν βρέθηκε κείμενο στο {os.path.basename(filepath)}", error=True)
+                    has_error = True
                     continue
 
                 output_path = os.path.splitext(filepath)[0] + ".mp3"
@@ -1946,14 +2003,22 @@ def main(page: ft.Page):
                 log(f"Ολοκληρώθηκε: {os.path.basename(output_path)}")
 
             except Exception as ex:
+                has_error = True
                 log(f"Σφάλμα στο {os.path.basename(filepath)}: {str(ex)}", error=True)
 
-        status_text.value = "Κατάσταση: Όλες οι μετατροπές ολοκληρώθηκαν!"
-        status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         set_all_buttons(False)
-        if any(p.lower().endswith('.docx') for p in file_queue):
-            await avatar_speak("Όλες οι μετατροπές ολοκληρώθηκαν με επιτυχία!")
+        if has_error:
+            status_text.value = "Κατάσταση: Προέκυψε σφάλμα κατά τη μετατροπή ήχου!"
+            status_text.color = ft.Colors.RED_400
+            if any(p.lower().endswith('.docx') for p in file_queue):
+                await avatar_speak("Παρουσιάστηκε σφάλμα κατά τη μετατροπή ήχου.")
+        else:
+            status_text.value = "Κατάσταση: Όλες οι μετατροπές ολοκληρώθηκαν!"
+            status_text.color = ft.Colors.GREEN_400
+            if any(p.lower().endswith('.docx') for p in file_queue):
+                await avatar_speak("Όλες οι μετατροπές ολοκληρώθηκαν με επιτυχία!")
+        page.update()
 
     # ── MP4 Conversion ────────────────────────────────────────────────────────
 
@@ -1969,10 +2034,12 @@ def main(page: ft.Page):
         progress_bar.value = 0
         page.update()
 
+        has_error = False
         for filepath in file_queue:
             ext = filepath.lower().split('.')[-1]
             if ext not in ('pdf', 'docx'):
                 log(f"Μη υποστηριζόμενο αρχείο για βίντεο: {os.path.basename(filepath)}", error=True)
+                has_error = True
                 continue
 
             status_text.value = f"🎬 Ξεκινά δημιουργία βίντεο: {os.path.basename(filepath)}"
@@ -2002,14 +2069,22 @@ def main(page: ft.Page):
                 log(f"🎬 Βίντεο: {os.path.basename(output_path)}")
 
             except Exception as ex:
+                has_error = True
                 log(f"Σφάλμα βίντεο στο {os.path.basename(filepath)}: {str(ex)}", error=True)
 
-        status_text.value = "Κατάσταση: Δημιουργία βίντεο ολοκληρώθηκε!"
-        status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         set_all_buttons(False)
-        if any(p.lower().endswith('.docx') for p in file_queue):
-            await avatar_speak("Η δημιουργία του βίντεο ολοκληρώθηκε με επιτυχία!")
+        if has_error:
+            status_text.value = "Κατάσταση: Προέκυψε σφάλμα κατά τη δημιουργία βίντεο!"
+            status_text.color = ft.Colors.RED_400
+            if any(p.lower().endswith('.docx') for p in file_queue):
+                await avatar_speak("Παρουσιάστηκε σφάλμα κατά τη δημιουργία του βίντεο.")
+        else:
+            status_text.value = "Κατάσταση: Δημιουργία βίντεο ολοκληρώθηκε!"
+            status_text.color = ft.Colors.GREEN_400
+            if any(p.lower().endswith('.docx') for p in file_queue):
+                await avatar_speak("Η δημιουργία του βίντεο ολοκληρώθηκε με επιτυχία!")
+        page.update()
 
     # ── Marquee Video Conversion ──────────────────────────────────────────────
 
@@ -2025,27 +2100,21 @@ def main(page: ft.Page):
         progress_bar.value = 0
         page.update()
 
+        has_error = False
         for filepath in file_queue:
             ext = filepath.lower().split('.')[-1]
             if ext not in ('pdf', 'docx'):
                 log(f"Μη υποστηριζόμενο αρχείο για marquee: {os.path.basename(filepath)}", error=True)
+                has_error = True
                 continue
 
-            status_text.value = f"📺 Ξεκινά δημιουργία Marquee video: {os.path.basename(filepath)}"
+            status_text.value = f"📜 Ξεκινά marquee βίντεο: {os.path.basename(filepath)}"
             status_text.color = ft.Colors.TEAL_300
             page.update()
 
             if ext == 'docx':
                 avatar_card.visible = True
                 await avatar_speak(f"Ετοιμάζω το Marquee banner για το «{os.path.basename(filepath)}»...")
-            ext = filepath.lower().split('.')[-1]
-            if ext not in ('pdf', 'docx'):
-                log(f"Μη υποστηριζόμενο αρχείο για marquee: {os.path.basename(filepath)}", error=True)
-                continue
-
-            status_text.value = f"📜 Ξεκινά marquee βίντεο: {os.path.basename(filepath)}"
-            status_text.color = ft.Colors.TEAL_300
-            page.update()
 
             try:
                 output_path = os.path.splitext(filepath)[0] + "_marquee.mp4"
@@ -2063,12 +2132,18 @@ def main(page: ft.Page):
                 log(f"📜 Marquee: {os.path.basename(output_path)}")
 
             except Exception as ex:
+                has_error = True
                 log(f"Σφάλμα marquee στο {os.path.basename(filepath)}: {str(ex)}", error=True)
 
-        status_text.value = "Κατάσταση: Δημιουργία marquee ολοκληρώθηκε!"
-        status_text.color = ft.Colors.GREEN_400
         progress_bar.visible = False
         set_all_buttons(False)
+        if has_error:
+            status_text.value = "Κατάσταση: Προέκυψε σφάλμα κατά τη δημιουργία Marquee!"
+            status_text.color = ft.Colors.RED_400
+        else:
+            status_text.value = "Κατάσταση: Δημιουργία marquee ολοκληρώθηκε!"
+            status_text.color = ft.Colors.GREEN_400
+        page.update()
 
     # ── About dialog ──────────────────────────────────────────────────────────
 
