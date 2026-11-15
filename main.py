@@ -10,7 +10,7 @@ import tempfile
 import textwrap
 import time
 
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -29,15 +29,23 @@ VOICE_FEMALE = "el-GR-AthinaNeural"
 VOICE_EN_MALE = "en-GB-RyanNeural"
 VOICE_EN_FEMALE = "en-GB-SoniaNeural"
 
-# Voice speed rates (Female voices speak slightly faster by default, so we slow them down by 7% for balanced pacing)
-RATE_MALE = "+0%"
-RATE_FEMALE = "-7%"
+# Voice speed rates and natural pitch adjustments for warm, balanced pacing
+RATE_MALE = "-2%"
+RATE_FEMALE = "-10%"
+PITCH_MALE = "-1Hz"
+PITCH_FEMALE = "-1Hz"
 
 def get_voice_rate(voice: str) -> str:
     """Returns the speech rate for the given voice."""
     if voice in (VOICE_FEMALE, VOICE_EN_FEMALE):
         return RATE_FEMALE
     return RATE_MALE
+
+def get_voice_pitch(voice: str) -> str:
+    """Returns the natural pitch adjustment for the given voice."""
+    if voice in (VOICE_FEMALE, VOICE_EN_FEMALE):
+        return PITCH_FEMALE
+    return PITCH_MALE
 
 def resolve_voice(voice_str: str, text: str = "") -> str:
     """Resolves a user-friendly or localized voice name to an Edge-TTS voice identifier."""
@@ -293,13 +301,14 @@ async def generate_tts_with_word_timings(text: str, voice: str, out_path: str, r
         return []
     if rate is None:
         rate = get_voice_rate(voice)
+    pitch = get_voice_pitch(voice)
     word_timings = []
     audio_bytes = bytearray()
 
     delays = [1.0, 2.0, 3.5, 5.0, 7.0]
     for attempt, delay in enumerate(delays):
         try:
-            communicate = edge_tts.Communicate(tts_text, voice, rate=rate, boundary="WordBoundary")
+            communicate = edge_tts.Communicate(tts_text, voice, rate=rate, pitch=pitch, boundary="WordBoundary")
             word_timings.clear()
             audio_bytes.clear()
 
@@ -339,10 +348,11 @@ async def generate_tts_chunk(text: str, voice: str, out_path: str, rate: str = N
         return False
     if rate is None:
         rate = get_voice_rate(voice)
+    pitch = get_voice_pitch(voice)
     delays = [1.0, 2.0, 3.5, 5.0, 7.0]
     for attempt, delay in enumerate(delays):
         try:
-            communicate = edge_tts.Communicate(tts_text, voice, rate=rate)
+            communicate = edge_tts.Communicate(tts_text, voice, rate=rate, pitch=pitch)
             await communicate.save(out_path)
             if os.path.exists(out_path) and os.path.getsize(out_path) > 500:
                 return True
@@ -376,11 +386,13 @@ def post_process_audio_file(
     normalize_loudness: bool = True,
 ) -> bool:
     """
-    Applies audio post-processing to synthetic speech audio:
+    Applies studio audio post-processing to synthetic speech audio:
     - Micro-fades (15ms in/out) to eliminate digital clicks/pops at boundaries.
-    - High-pass filter (80 Hz) to eliminate low-frequency rumble and DC offset.
-    - Vocal presence equalizer (3 kHz, +1.2 dB) for clarity and warmth.
-    - Sibilance de-harshing (7.5 kHz, -2.0 dB) to soften harsh synthetic 's' sounds.
+    - High-pass filter (75 Hz) to eliminate low-frequency rumble and DC offset.
+    - Warm vocal body equalizer (190 Hz, +1.8 dB) for natural chest resonance.
+    - Anti-metallic / nasal dip (3.1 kHz, -1.4 dB) to remove robotic harshness.
+    - Sibilance de-harshing (7.5 kHz, -2.2 dB) to soften harsh synthetic 's' sounds.
+    - Gentle broadcast vocal compressor (ratio 2:1) for smooth syllable dynamics.
     - EBU R128 loudness normalization (-16 LUFS, True Peak -1.5 dB) for consistent volume.
     """
     import subprocess
@@ -401,9 +413,11 @@ def post_process_audio_file(
         ])
     if warm_eq:
         filters.extend([
-            "highpass=f=80",
-            "equalizer=f=3000:t=q:w=1.2:g=1.2",
-            "equalizer=f=7500:t=q:w=1.5:g=-2.0",
+            "highpass=f=75",
+            "equalizer=f=190:t=q:w=1.1:g=1.8",
+            "equalizer=f=3100:t=q:w=1.4:g=-1.4",
+            "equalizer=f=7500:t=q:w=1.5:g=-2.2",
+            "acompressor=threshold=-18dB:ratio=2:attack=15:release=150:makeup=1",
         ])
     if normalize_loudness:
         filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
