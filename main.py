@@ -1,16 +1,110 @@
+import os
+import sys
+
+# Ensure root directory / _MEIPASS and Windows Flet Desktop MSIX runtime are configured BEFORE importing flet
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    _BASE_DIR = sys._MEIPASS
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if sys.platform == "win32":
+    os.environ.setdefault("FLET_NO_IMPELLER", "true")
+    if "FLET_VIEW_PATH" not in os.environ:
+        _EXE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else _BASE_DIR
+        for _candidate in (
+            os.path.join(_EXE_DIR, "flet_client"),
+            os.path.join(_BASE_DIR, "flet_client"),
+            os.path.join(_BASE_DIR, "flet_desktop", "app", "flet"),
+        ):
+            if os.path.isfile(os.path.join(_candidate, "flet.exe")):
+                os.environ["FLET_VIEW_PATH"] = _candidate
+                break
+
 import flet as ft
 import flet_desktop
 import pymupdf as fitz
 import docx
 import edge_tts
 import asyncio
-import os
-import sys
 import tempfile
 import textwrap
 import time
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
+
+
+def get_documents_dir() -> str:
+    """Resolve the real user Documents folder (supports Windows OneDrive/locale & Linux)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            # FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+            folder_id = GUID(
+                0xFDD39AD0, 0x238F, 0x46AF,
+                (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7),
+            )
+            shell32 = ctypes.windll.shell32
+            ole32 = ctypes.windll.ole32
+            shell32.SHGetKnownFolderPath.argtypes = [
+                ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_wchar_p),
+            ]
+            shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+            ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ole32.CoTaskMemFree.restype = None
+
+            path_ptr = ctypes.c_wchar_p()
+            hr = shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(path_ptr))
+            if hr == 0 and path_ptr.value:
+                result = path_ptr.value
+                ole32.CoTaskMemFree(path_ptr)
+                return result
+        except Exception:
+            pass
+    return os.path.join(os.path.expanduser("~"), "Documents")
+
+
+def get_app_user_dir(app_name: str = "Spyken") -> str:
+    """Return and ensure the writable user data/output directory inside Documents\\<app_name>."""
+    app_dir = os.path.join(get_documents_dir(), app_name)
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+def _is_dir_writable(dir_path: str) -> bool:
+    """Safely check whether a directory allows creating files (essential under MSIX read-only CWD)."""
+    try:
+        if not dir_path or not os.path.isdir(dir_path):
+            return False
+        probe = os.path.join(dir_path, f".spyken_write_probe_{os.getpid()}.tmp")
+        with open(probe, "wb") as f:
+            f.write(b"")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_writable_output_path(preferred_path: str) -> str:
+    """
+    Use preferred_path if its parent directory is writable; otherwise fall back safely
+    to Documents\\Spyken\\<filename> to prevent PermissionError crashes in MSIX or read-only folders.
+    """
+    abs_path = os.path.abspath(preferred_path)
+    parent_dir = os.path.dirname(abs_path)
+    if _is_dir_writable(parent_dir):
+        return abs_path
+    return os.path.join(get_app_user_dir("Spyken"), os.path.basename(abs_path))
 
 def get_asset_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -1816,9 +1910,14 @@ async def convert_to_audio(paragraphs: list[str], output_path: str, progress_cal
 # ──────────────────────────────── UI ──────────────────────────────────────────
 
 def main(page: ft.Page):
-    page.title = "Spyken by spyalekos - Έγγραφο σε Ομιλία (MP3) & Βίντεο (MP4)"
+    get_app_user_dir("Spyken")
+    page.title = "Spyken - Ψηφιακός Εκφωνητής (MP3 & MP4)"
     page.window.width = 680
     page.window.height = 740
+    if sys.platform == "win32":
+        icon_ico = get_asset_path("assets/icon.ico")
+        if os.path.exists(icon_ico):
+            page.window.icon = icon_ico
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 30
     page.run_task(page.window.center)
@@ -2003,7 +2102,7 @@ def main(page: ft.Page):
                     has_error = True
                     continue
 
-                output_path = os.path.splitext(filepath)[0] + ".mp3"
+                output_path = resolve_writable_output_path(os.path.splitext(filepath)[0] + ".mp3")
 
                 def update_progress(current, total, msg=""):
                     progress_bar.value = (current / total) if total > 0 else 0
@@ -2065,7 +2164,7 @@ def main(page: ft.Page):
                 await avatar_speak(f"Ετοιμάζω το βίντεο παρουσίασης για το «{os.path.basename(filepath)}»...")
 
             try:
-                output_path = os.path.splitext(filepath)[0] + ".mp4"
+                output_path = resolve_writable_output_path(os.path.splitext(filepath)[0] + ".mp4")
                 loop = asyncio.get_running_loop()
 
                 def update_video_progress(current, total, msg=""):
@@ -2131,7 +2230,7 @@ def main(page: ft.Page):
                 await avatar_speak(f"Ετοιμάζω το Marquee banner για το «{os.path.basename(filepath)}»...")
 
             try:
-                output_path = os.path.splitext(filepath)[0] + "_marquee.mp4"
+                output_path = resolve_writable_output_path(os.path.splitext(filepath)[0] + "_marquee.mp4")
                 loop = asyncio.get_running_loop()
 
                 def update_marquee_progress(current, total, msg=""):
@@ -2199,7 +2298,7 @@ def main(page: ft.Page):
                         ft.Text("  • Αγγλική Γυναικεία: en-GB-SoniaNeural", size=13, color=ft.Colors.GREY_400),
                         
                         ft.Divider(height=10, color=ft.Colors.WHITE_24),
-                        ft.Text("by spyalekos • github.com/spyalekos", size=13, color=ft.Colors.GREY_500),
+                        ft.Text("Spyken • Ψηφιακός Εκφωνητής", size=13, color=ft.Colors.GREY_500),
                     ],
                     spacing=6,
                     scroll=ft.ScrollMode.AUTO,
@@ -2209,13 +2308,11 @@ def main(page: ft.Page):
                 padding=10,
             ),
             actions=[
-                ft.TextButton("Κλείσιμο", on_click=lambda e: (setattr(dlg, 'open', False), page.update()))
+                ft.TextButton("Κλείσιμο", on_click=lambda e: page.pop_dialog())
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.overlay.append(dlg)
-        dlg.open = True
-        page.update()
+        page.show_dialog(dlg)
 
     # ── Buttons ───────────────────────────────────────────────────────────────
 
@@ -2301,45 +2398,53 @@ def main(page: ft.Page):
     page.add(main_container)
     page.update()
 
-    # Close PyInstaller Splash screen if running as compiled executable
-    try:
-        import pyi_splash
-        pyi_splash.close()
-    except ImportError:
-        pass
+    # Close PyInstaller Splash screen if running as onefile executable with active splash IPC
+    if "_PYI_SPLASH_IPC" in os.environ:
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except Exception:
+            pass
 
 
 def play_audio_windows(file_path: str):
+    if sys.platform != "win32":
+        return False
     import ctypes
+    from ctypes import wintypes
     import time
-    
+
+    winmm = ctypes.windll.winmm
+    winmm.mciSendStringW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.UINT, wintypes.HANDLE]
+    winmm.mciSendStringW.restype = wintypes.DWORD
+
     abs_path = os.path.abspath(file_path)
     alias = f"spyken_play_{os.getpid()}"
     open_cmd = f'open "{abs_path}" type mpegvideo alias {alias}'
-    
-    res = ctypes.windll.winmm.mciSendStringW(open_cmd, None, 0, 0)
+
+    res = winmm.mciSendStringW(open_cmd, None, 0, None)
     if res != 0:
         return False
-        
+
     try:
         play_cmd = f'play {alias}'
-        res = ctypes.windll.winmm.mciSendStringW(play_cmd, None, 0, 0)
+        res = winmm.mciSendStringW(play_cmd, None, 0, None)
         if res != 0:
             return False
-            
+
         buffer = ctypes.create_unicode_buffer(128)
         while True:
-            res = ctypes.windll.winmm.mciSendStringW(f'status {alias} mode', buffer, 128, 0)
+            res = winmm.mciSendStringW(f'status {alias} mode', buffer, 128, None)
             if res != 0:
                 break
             mode = buffer.value.strip()
             if mode != 'playing':
                 break
             time.sleep(0.05)
-            
+
     finally:
-        ctypes.windll.winmm.mciSendStringW(f'close {alias}', None, 0, 0)
-        
+        winmm.mciSendStringW(f'close {alias}', None, 0, None)
+
     return True
 
 
@@ -2529,7 +2634,9 @@ async def cli_process_text(text: str, mode: str, output_path: str = None, voice:
 
     if mode == "audio":
         if not output_path:
-            output_path = "output.mp3"
+            output_path = resolve_writable_output_path("output.mp3")
+        else:
+            output_path = resolve_writable_output_path(output_path)
         print(f"Spyken: Μετατροπή κειμένου σε ήχο MP3 -> {output_path}")
         paragraphs = [clean_document_text(p) for p in text.splitlines() if is_valid_text(clean_document_text(p))]
         if not paragraphs and is_valid_text(text):
@@ -2548,7 +2655,9 @@ async def cli_process_text(text: str, mode: str, output_path: str = None, voice:
     elif mode in ("video", "marquee"):
         default_ext = "_marquee.mp4" if mode == "marquee" else ".mp4"
         if not output_path:
-            output_path = f"output{default_ext}"
+            output_path = resolve_writable_output_path(f"output{default_ext}")
+        else:
+            output_path = resolve_writable_output_path(output_path)
         mode_label = "Marquee Video" if mode == "marquee" else "Βίντεο Παρουσίασης MP4"
         print(f"Spyken: Μετατροπή κειμένου σε {mode_label} -> {output_path}")
 
@@ -2615,7 +2724,7 @@ async def cli_process_documents(files: list[str], mode: str, output_dest: str = 
                 os.makedirs(output_dest, exist_ok=True)
                 target_out = os.path.join(os.path.abspath(output_dest), out_filename)
             else:
-                target_out = os.path.join(os.path.dirname(filepath), out_filename)
+                target_out = resolve_writable_output_path(os.path.join(os.path.dirname(filepath), out_filename))
 
         print(f"    Αρχείο εξόδου: {target_out}")
 
@@ -2788,11 +2897,12 @@ def cli_main(raw_args: list[str]) -> int:
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Close PyInstaller Splash screen immediately if running from command line
-        try:
-            import pyi_splash
-            pyi_splash.close()
-        except ImportError:
-            pass
+        if "_PYI_SPLASH_IPC" in os.environ:
+            try:
+                import pyi_splash
+                pyi_splash.close()
+            except Exception:
+                pass
 
         setup_windows_console()
         ret = cli_main(sys.argv[1:])
